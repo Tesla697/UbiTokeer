@@ -1,0 +1,25 @@
+# Activator binaries and DLLs
+activator/
+
+# Generated tokens
+*.ini
+token/
+
+# Quota data
+quota.json
+
+# Credentials
+accounts.json
+config.json
+LoginStore.dat
+
+# Logs
+*.log
+ubitokeer.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+venv/
