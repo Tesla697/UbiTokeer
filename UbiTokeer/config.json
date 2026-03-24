@@ -1,0 +1,7 @@
+{
+  "port": 8090,
+  "activator_path": "activator/DenuvoTicket.exe",
+  "token_output_dir": "activator/token",
+  "daily_limit": 5,
+  "process_timeout": 60
+}
