@@ -13,7 +13,12 @@ class DenuvoWorkerError(Exception):
 
 class DenuvoWorker:
     def __init__(self, activator_path: str, token_output_dir: str, process_timeout: int = 60):
-        self._activator_path = Path(activator_path).resolve()
+        act_path = Path(activator_path).resolve()
+        # If given a directory, look for DenuvoTicket.exe inside it
+        if act_path.is_dir():
+            self._activator_path = act_path / "DenuvoTicket.exe"
+        else:
+            self._activator_path = act_path
         self._token_output_dir = Path(token_output_dir).resolve()
         self._process_timeout = process_timeout
 

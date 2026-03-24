@@ -141,6 +141,9 @@ class JobQueue:
             except Exception:
                 pass
 
+    def update_config(self, config: dict) -> None:
+        self._config = config
+
     def shutdown(self) -> None:
         self._running = False
         with self._condition:

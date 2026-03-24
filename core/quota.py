@@ -74,6 +74,16 @@ class QuotaTracker:
     def can_generate(self, account_email: str, uplay_id: str) -> bool:
         return self.get_remaining(account_email, uplay_id) > 0
 
+    def decrement(self, account_email: str, uplay_id: str) -> None:
+        with self._lock:
+            key = self._key(account_email, uplay_id)
+            entry = self._data.get(key)
+            if entry and entry["count"] > 0:
+                entry["count"] -= 1
+                if entry["count"] == 0:
+                    del self._data[key]
+                self._save()
+
     def record(self, account_email: str, uplay_id: str) -> None:
         with self._lock:
             key = self._key(account_email, uplay_id)
