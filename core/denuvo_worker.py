@@ -25,9 +25,10 @@ class DenuvoWorker:
         if not self._activator_path.exists():
             raise FileNotFoundError(f"DenuvoTicket.exe not found at {self._activator_path}")
 
-    def generate_token(self, account_number: int, token_req: str) -> str:
+    def generate_token(self, account_number: int, token_req: str) -> dict:
         """
         Run DenuvoTicket.exe via ConPTY, send account + token_req, wait for token.ini.
+        Returns dict with 'token_ini' (file content) and 'console_output' (full PTY output).
         """
         token_ini_path = self._token_output_dir / "token.ini"
         if token_ini_path.exists():
@@ -126,4 +127,7 @@ class DenuvoWorker:
             raise DenuvoWorkerError("token.ini was generated but is empty")
 
         logger.info("token.ini generated successfully")
-        return content
+        return {
+            "token_ini": content,
+            "console_output": "".join(collected_output),
+        }

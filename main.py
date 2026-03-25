@@ -11,7 +11,7 @@ from pathlib import Path
 
 import uvicorn
 
-from core.job_queue import JobQueue
+from core.job_queue import JobQueue, load_output_formats
 from gui.app import UbiTokeerApp
 from server import api as server_api
 
@@ -32,10 +32,9 @@ def load_config() -> dict:
             logger.error(f"Failed to load config.json: {e}")
     return {
         "port": 8090,
-        "activator_path": "activator",
-        "token_output_dir": "activator/token",
         "daily_limit": 5,
-        "process_timeout": 60,
+        "process_timeout": 90,
+        "output_formats": {},
     }
 
 
@@ -128,6 +127,9 @@ def main() -> None:
 
     setup_logging(app.get_log_handler())
     logger.info("UbiTokeer starting up...")
+
+    # Load output format overrides (e.g. {"4740": "dbdata"})
+    load_output_formats(config.get("output_formats", {}))
 
     # Job queue
     job_queue = JobQueue(

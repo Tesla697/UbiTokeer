@@ -4,11 +4,19 @@ from datetime import datetime
 from typing import Callable, Optional
 
 from core.accounts import get_account_for_uplay_id, get_accounts_for_uplay_id, has_any_account_for_uplay_id
-from core.denuvo_worker import DenuvoWorker, DenuvoWorkerError
+from core.cli_worker import CliWorker
 from core.job import Job, JobStatus
 from core.quota import QuotaExceededError, QuotaTracker
 
 logger = logging.getLogger("ubitokeer")
+
+# Map uplay_id to output format. Games not listed default to "token_ini".
+OUTPUT_FORMATS = {}
+
+
+def load_output_formats(formats: dict) -> None:
+    """Load output format overrides, e.g. {"4740": "dbdata"}."""
+    OUTPUT_FORMATS.update(formats)
 
 
 class BusyError(Exception):
@@ -25,10 +33,8 @@ class JobQueue:
         self._jobs: dict[str, Job] = {}
         self._condition = threading.Condition(self._lock)
         self._quota = QuotaTracker(daily_limit=config.get("daily_limit", 5))
-        self._worker_obj = DenuvoWorker(
-            activator_path=config["activator_path"],
-            token_output_dir=config["token_output_dir"],
-            process_timeout=config.get("process_timeout", 60),
+        self._worker = CliWorker(
+            process_timeout=config.get("process_timeout", 90),
         )
         self._running = True
         self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
@@ -36,7 +42,6 @@ class JobQueue:
         logger.info("Job queue started")
 
     def submit(self, uplay_id: str, token_req: str) -> Job:
-        """Submit a new token generation job."""
         if not has_any_account_for_uplay_id(uplay_id):
             raise ValueError(f"No account assigned to uplay_id={uplay_id}")
 
@@ -53,7 +58,8 @@ class JobQueue:
             job = Job(
                 uplay_id=uplay_id,
                 account_email=account["email"],
-                account_number=account["number"],
+                accid=account["accid"],
+                folder=account["folder"],
                 token_req=token_req,
             )
             self._jobs[job.id] = job
@@ -103,7 +109,7 @@ class JobQueue:
 
         # Build list of accounts to try: primary first, then fallbacks
         all_accounts = get_accounts_for_uplay_id(job.uplay_id)
-        accounts_to_try = [{"number": job.account_number, "email": job.account_email}]
+        accounts_to_try = [{"email": job.account_email, "accid": job.accid, "folder": job.folder}]
         for acc in all_accounts:
             if acc["email"] != job.account_email and self._quota.can_generate(acc["email"], job.uplay_id):
                 accounts_to_try.append(acc)
@@ -113,18 +119,37 @@ class JobQueue:
             if attempt > 0:
                 logger.info(f"Job {job.id}: Retrying with fallback account {acc['email']}...")
                 job.account_email = acc["email"]
-                job.account_number = acc["number"]
+                job.accid = acc["accid"]
+                job.folder = acc["folder"]
 
             try:
-                token_ini = self._worker_obj.generate_token(
-                    account_number=acc["number"],
+                result = self._worker.generate(
+                    folder=acc["folder"],
+                    accid=acc["accid"],
+                    uplay_id=job.uplay_id,
                     token_req=job.token_req,
                 )
-                job.token_ini = token_ini
+
+                job.denuvo_token = result["denuvo_token"]
+                job.ownership_token = result["ownership_token"]
+                job.dlc_ids = result["dlc_ids"]
+                job.console_output = result.get("console_output", "")
+
+                # Build formatted output based on game's output format
+                output_format = OUTPUT_FORMATS.get(job.uplay_id, "token_ini")
+                if output_format == "dbdata":
+                    job.dbdata_json = CliWorker.build_dbdata_json(
+                        job.denuvo_token, job.ownership_token, job.dlc_ids
+                    )
+                else:
+                    job.token_ini = CliWorker.build_token_ini(
+                        job.denuvo_token, job.ownership_token
+                    )
+
                 job.status = JobStatus.DONE
                 job.finished_at = datetime.utcnow()
                 self._quota.record(acc["email"], job.uplay_id)
-                logger.info(f"Job {job.id} completed successfully (account {acc['email']})")
+                logger.info(f"Job {job.id} completed successfully (account {acc['email']}, format={output_format})")
                 self._notify_update()
                 return
 
@@ -138,7 +163,6 @@ class JobQueue:
         job.error = str(last_error)
         job.finished_at = datetime.utcnow()
         logger.error(f"Job {job.id} failed on all accounts: {last_error}")
-
         self._notify_update()
 
     def get_quota_simple(self, uplay_id: str) -> dict:
