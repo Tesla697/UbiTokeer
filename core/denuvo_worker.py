@@ -1,9 +1,8 @@
 import logging
-import os
-import subprocess
-import tempfile
 import time
 from pathlib import Path
+
+import winpty
 
 logger = logging.getLogger("ubitokeer")
 
@@ -28,10 +27,8 @@ class DenuvoWorker:
 
     def generate_token(self, account_number: int, token_req: str) -> str:
         """
-        Run DenuvoTicket.exe, select account, feed token_req, return token.ini content.
-
-        Uses cmd.exe to pipe a temp file into the exe so that the .NET app gets a
-        real console handle (avoids System.IO.IOException on Console.CursorTop).
+        Run DenuvoTicket.exe via a Windows pseudo-console (ConPTY) so the .NET app
+        has a real console handle for its interactive menu.
 
         Args:
             account_number: The menu number to select the account (1, 2, etc.)
@@ -48,70 +45,62 @@ class DenuvoWorker:
             except Exception as e:
                 logger.warning(f"Failed to delete old token.ini: {e}")
 
-        # Build stdin: account number + newline, then token_req + newline
-        stdin_data = f"{account_number}\n{token_req}\n"
-
         logger.info(f"Starting DenuvoTicket.exe (account #{account_number})...")
 
-        working_dir = self._activator_path.parent
-        stdout_path = working_dir / "_stdout.tmp"
-        stderr_path = working_dir / "_stderr.tmp"
+        working_dir = str(self._activator_path.parent)
+        output_lines = []
 
-        # Write input to a temp file, then use cmd /c to pipe it in
-        # This gives the .NET app a real console allocation via cmd.exe
-        stdin_tmp = None
         try:
-            stdin_tmp = tempfile.NamedTemporaryFile(
-                mode="w", suffix=".txt", dir=str(working_dir),
-                delete=False, encoding="utf-8",
-            )
-            stdin_tmp.write(stdin_data)
-            stdin_tmp.close()
-
-            # Use cmd /c with input redirection + output capture
-            cmd = (
-                f'cmd /c ""{self._activator_path}" < "{stdin_tmp.name}" '
-                f'> "{stdout_path}" 2> "{stderr_path}""'
+            # Spawn inside a real pseudo-console via pywinpty
+            pty = winpty.PtyProcess.spawn(
+                f'"{self._activator_path}"',
+                cwd=working_dir,
             )
 
-            subprocess.run(
-                cmd,
-                shell=True,
-                timeout=self._process_timeout,
-                cwd=str(working_dir),
-                env={**os.environ},
-            )
+            deadline = time.time() + self._process_timeout
 
-            stdout = stdout_path.read_text(encoding="utf-8", errors="replace") if stdout_path.exists() else ""
-            stderr = stderr_path.read_text(encoding="utf-8", errors="replace") if stderr_path.exists() else ""
+            # Wait for the menu to appear, then send account number
+            time.sleep(2)
+            self._read_available(pty, output_lines)
+            logger.debug(f"Pre-account output: {''.join(output_lines)}")
 
-            logger.debug(f"DenuvoTicket stdout:\n{stdout}")
-            if stderr:
-                logger.debug(f"DenuvoTicket stderr:\n{stderr}")
+            pty.write(f"{account_number}\r\n")
+            logger.debug(f"Sent account number: {account_number}")
 
-            # Check for authentication failure
-            if "Authentication failed" in stdout or "Authentication failed" in stderr:
+            # Wait for authentication + prompt for token_req
+            time.sleep(5)
+            self._read_available(pty, output_lines)
+            logger.debug(f"Post-account output: {''.join(output_lines[-20:])}")
+
+            # Send the token request
+            pty.write(f"{token_req}\r\n")
+            logger.debug("Sent token_req data")
+
+            # Wait for processing to complete
+            while pty.isalive() and time.time() < deadline:
+                time.sleep(1)
+                self._read_available(pty, output_lines)
+
+            # Final read
+            self._read_available(pty, output_lines)
+
+            full_output = "".join(output_lines)
+            logger.debug(f"DenuvoTicket full output:\n{full_output}")
+
+            # Check for errors
+            if "Authentication failed" in full_output:
                 raise DenuvoWorkerError("Authentication failed — account credentials may be invalid")
 
-            if "error" in stdout.lower() and "successful" not in stdout.lower():
-                raise DenuvoWorkerError(f"DenuvoTicket reported an error:\n{stdout}")
+            if "error" in full_output.lower() and "successful" not in full_output.lower():
+                raise DenuvoWorkerError(f"DenuvoTicket reported an error:\n{full_output}")
 
-        except subprocess.TimeoutExpired:
-            raise DenuvoWorkerError(
-                f"DenuvoTicket.exe timed out after {self._process_timeout}s"
-            )
-        except FileNotFoundError:
-            raise DenuvoWorkerError(
-                f"DenuvoTicket.exe not found at {self._activator_path}"
-            )
-        finally:
-            # Clean up temp files
-            for p in [stdin_tmp and Path(stdin_tmp.name), stdout_path, stderr_path]:
-                if p and p.exists():
-                    try:
-                        p.unlink()
-                    except Exception:
-                        pass
+            if pty.isalive():
+                pty.terminate()
+
+        except DenuvoWorkerError:
+            raise
+        except Exception as e:
+            raise DenuvoWorkerError(f"Failed to run DenuvoTicket.exe: {e}")
 
         # Wait briefly for file to be written
         for _ in range(10):
@@ -122,7 +111,7 @@ class DenuvoWorker:
         # Read the generated token.ini
         if not token_ini_path.exists():
             raise DenuvoWorkerError(
-                f"token.ini was not generated. DenuvoTicket output:\n{stdout}"
+                f"token.ini was not generated. DenuvoTicket output:\n{''.join(output_lines)}"
             )
 
         content = token_ini_path.read_text(encoding="utf-8")
@@ -131,3 +120,17 @@ class DenuvoWorker:
 
         logger.info("token.ini generated successfully")
         return content
+
+    @staticmethod
+    def _read_available(pty, output_lines: list, chunk_size: int = 4096) -> None:
+        """Read all currently available output from the PTY."""
+        try:
+            while True:
+                data = pty.read(chunk_size)
+                if not data:
+                    break
+                output_lines.append(data)
+        except EOFError:
+            pass
+        except Exception:
+            pass
