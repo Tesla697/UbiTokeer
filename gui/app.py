@@ -180,11 +180,12 @@ class UbiTokeerApp(ctk.CTk):
         # Scrollable accounts table
         self._accounts_frame = ctk.CTkScrollableFrame(parent, height=220)
         self._accounts_frame.pack(fill="both", expand=True, padx=10, pady=(0, 4))
-        self._accounts_frame.grid_columnconfigure(0, weight=2)   # Email
-        self._accounts_frame.grid_columnconfigure(1, weight=2)   # Folder
-        self._accounts_frame.grid_columnconfigure(2, weight=2)   # Uplay IDs
-        self._accounts_frame.grid_columnconfigure(3, weight=1)   # Limit
-        self._accounts_frame.grid_columnconfigure(4, weight=1)   # Actions
+        self._accounts_frame.grid_columnconfigure(0, weight=1)   # Name
+        self._accounts_frame.grid_columnconfigure(1, weight=2)   # Email
+        self._accounts_frame.grid_columnconfigure(2, weight=2)   # Folder
+        self._accounts_frame.grid_columnconfigure(3, weight=2)   # Uplay IDs
+        self._accounts_frame.grid_columnconfigure(4, weight=1)   # Limit
+        self._accounts_frame.grid_columnconfigure(5, weight=1)   # Actions
 
         self._account_rows: list[dict] = []
         self._render_accounts()
@@ -245,43 +246,49 @@ class UbiTokeerApp(ctk.CTk):
         self._account_rows.clear()
 
         # Header
-        for col, text in enumerate(["Email", "Folder", "Uplay IDs", "Limit", ""]):
+        for col, text in enumerate(["Name", "Email", "Folder", "Uplay IDs", "Limit", ""]):
             ctk.CTkLabel(
                 self._accounts_frame, text=text, font=("Segoe UI", 11, "bold")
             ).grid(row=0, column=col, sticky="w", padx=6, pady=2)
 
         accounts = self._load_accounts()
         for i, acc in enumerate(accounts, start=1):
+            # Name
+            name_entry = ctk.CTkEntry(self._accounts_frame, width=120)
+            name_entry.insert(0, acc.get("name", ""))
+            name_entry.grid(row=i, column=0, sticky="w", padx=6, pady=2)
+
             # Email (read-only label)
             ctk.CTkLabel(
                 self._accounts_frame, text=acc["email"], anchor="w"
-            ).grid(row=i, column=0, sticky="w", padx=6, pady=2)
+            ).grid(row=i, column=1, sticky="w", padx=6, pady=2)
 
             # Folder
             folder_entry = ctk.CTkEntry(self._accounts_frame, width=180)
             folder_entry.insert(0, acc.get("folder", ""))
-            folder_entry.grid(row=i, column=1, sticky="w", padx=6, pady=2)
+            folder_entry.grid(row=i, column=2, sticky="w", padx=6, pady=2)
 
             # Uplay IDs
             uid_entry = ctk.CTkEntry(self._accounts_frame, width=160)
             uid_entry.insert(0, ", ".join(acc.get("uplay_ids", [])))
-            uid_entry.grid(row=i, column=2, sticky="w", padx=6, pady=2)
+            uid_entry.grid(row=i, column=3, sticky="w", padx=6, pady=2)
 
             # Daily limit
             limit_entry = ctk.CTkEntry(self._accounts_frame, width=50)
             limit_entry.insert(0, str(acc.get("daily_limit", 5)))
-            limit_entry.grid(row=i, column=3, sticky="w", padx=6, pady=2)
+            limit_entry.grid(row=i, column=4, sticky="w", padx=6, pady=2)
 
             # Remove button
             ctk.CTkButton(
                 self._accounts_frame, text="\u2715", width=30, height=24,
                 fg_color="#f44336", hover_color="#d32f2f",
                 command=lambda email=acc["email"]: self._remove_account(email)
-            ).grid(row=i, column=4, padx=6, pady=2)
+            ).grid(row=i, column=5, padx=6, pady=2)
 
             self._account_rows.append({
                 "email": acc["email"],
                 "accid": acc.get("accid", ""),
+                "name_entry": name_entry,
                 "folder_entry": folder_entry,
                 "uid_entry": uid_entry,
                 "limit_entry": limit_entry,
@@ -311,7 +318,13 @@ class UbiTokeerApp(ctk.CTk):
         )
         folder = (folder_dialog.get_input() or "").strip()
 
+        name_dialog = ctk.CTkInputDialog(
+            text="Enter account name (e.g. Avatar Acc 1):", title="Account Name"
+        )
+        name = (name_dialog.get_input() or "").strip()
+
         accounts.append({
+            "name": name,
             "email": email,
             "accid": accid,
             "folder": folder,
@@ -320,7 +333,7 @@ class UbiTokeerApp(ctk.CTk):
         })
         self._write_accounts(accounts)
         self._render_accounts()
-        logging.getLogger("ubitokeer").info(f"Account {email} added (folder={folder})")
+        logging.getLogger("ubitokeer").info(f"Account {email} added as '{name}' (folder={folder})")
 
     def _remove_account(self, email: str) -> None:
         accounts = self._load_accounts()
@@ -337,6 +350,7 @@ class UbiTokeerApp(ctk.CTk):
             row = email_map.get(acc["email"])
             if not row:
                 continue
+            acc["name"] = row["name_entry"].get().strip()
             acc["folder"] = row["folder_entry"].get().strip()
             if row.get("accid"):
                 acc["accid"] = row["accid"]
@@ -522,7 +536,8 @@ class UbiTokeerApp(ctk.CTk):
                 remaining = self._quota_tracker.get_remaining(email, uid)
                 used = daily_limit - remaining
 
-                ctk.CTkLabel(table, text=email, anchor="w").grid(
+                display_name = acc.get("name") or email
+                ctk.CTkLabel(table, text=display_name, anchor="w").grid(
                     row=i, column=0, sticky="w", padx=6, pady=1
                 )
 
