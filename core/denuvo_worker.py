@@ -53,7 +53,7 @@ class DenuvoWorker:
         try:
             # Spawn inside a real pseudo-console via pywinpty
             pty = winpty.PtyProcess.spawn(
-                f'"{self._activator_path}"',
+                str(self._activator_path),
                 cwd=working_dir,
             )
 
