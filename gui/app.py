@@ -180,10 +180,10 @@ class UbiTokeerApp(ctk.CTk):
         # Scrollable accounts table
         self._accounts_frame = ctk.CTkScrollableFrame(parent, height=220)
         self._accounts_frame.pack(fill="both", expand=True, padx=10, pady=(0, 4))
-        self._accounts_frame.grid_columnconfigure(0, weight=1)   # #
-        self._accounts_frame.grid_columnconfigure(1, weight=3)   # Email
+        self._accounts_frame.grid_columnconfigure(0, weight=2)   # Email
+        self._accounts_frame.grid_columnconfigure(1, weight=2)   # Folder
         self._accounts_frame.grid_columnconfigure(2, weight=2)   # Uplay IDs
-        self._accounts_frame.grid_columnconfigure(3, weight=1)   # Daily Limit
+        self._accounts_frame.grid_columnconfigure(3, weight=1)   # Limit
         self._accounts_frame.grid_columnconfigure(4, weight=1)   # Actions
 
         self._account_rows: list[dict] = []
@@ -245,22 +245,22 @@ class UbiTokeerApp(ctk.CTk):
         self._account_rows.clear()
 
         # Header
-        for col, text in enumerate(["#", "Email", "Uplay IDs", "Limit", ""]):
+        for col, text in enumerate(["Email", "Folder", "Uplay IDs", "Limit", ""]):
             ctk.CTkLabel(
                 self._accounts_frame, text=text, font=("Segoe UI", 11, "bold")
             ).grid(row=0, column=col, sticky="w", padx=6, pady=2)
 
         accounts = self._load_accounts()
         for i, acc in enumerate(accounts, start=1):
-            # Number
-            num_entry = ctk.CTkEntry(self._accounts_frame, width=40)
-            num_entry.insert(0, str(acc.get("number", i)))
-            num_entry.grid(row=i, column=0, sticky="w", padx=6, pady=2)
-
             # Email (read-only label)
             ctk.CTkLabel(
                 self._accounts_frame, text=acc["email"], anchor="w"
-            ).grid(row=i, column=1, sticky="w", padx=6, pady=2)
+            ).grid(row=i, column=0, sticky="w", padx=6, pady=2)
+
+            # Folder
+            folder_entry = ctk.CTkEntry(self._accounts_frame, width=180)
+            folder_entry.insert(0, acc.get("folder", ""))
+            folder_entry.grid(row=i, column=1, sticky="w", padx=6, pady=2)
 
             # Uplay IDs
             uid_entry = ctk.CTkEntry(self._accounts_frame, width=160)
@@ -281,7 +281,8 @@ class UbiTokeerApp(ctk.CTk):
 
             self._account_rows.append({
                 "email": acc["email"],
-                "num_entry": num_entry,
+                "accid": acc.get("accid", ""),
+                "folder_entry": folder_entry,
                 "uid_entry": uid_entry,
                 "limit_entry": limit_entry,
             })
@@ -295,23 +296,31 @@ class UbiTokeerApp(ctk.CTk):
             return
         email = email.strip()
 
-        # Check if already exists
         accounts = self._load_accounts()
         if any(a["email"] == email for a in accounts):
             logging.getLogger("ubitokeer").warning(f"Account {email} already exists")
             return
 
-        # Assign next number
-        max_num = max((a.get("number", 0) for a in accounts), default=0)
+        accid_dialog = ctk.CTkInputDialog(
+            text="Enter accid (UUID):", title="Account ID"
+        )
+        accid = (accid_dialog.get_input() or "").strip()
+
+        folder_dialog = ctk.CTkInputDialog(
+            text="Enter folder path (e.g. activator_cli/avatar-acc1):", title="Folder"
+        )
+        folder = (folder_dialog.get_input() or "").strip()
+
         accounts.append({
-            "number": max_num + 1,
             "email": email,
+            "accid": accid,
+            "folder": folder,
             "uplay_ids": [],
             "daily_limit": 5,
         })
         self._write_accounts(accounts)
         self._render_accounts()
-        logging.getLogger("ubitokeer").info(f"Account {email} added (#{max_num + 1})")
+        logging.getLogger("ubitokeer").info(f"Account {email} added (folder={folder})")
 
     def _remove_account(self, email: str) -> None:
         accounts = self._load_accounts()
@@ -328,10 +337,9 @@ class UbiTokeerApp(ctk.CTk):
             row = email_map.get(acc["email"])
             if not row:
                 continue
-            try:
-                acc["number"] = int(row["num_entry"].get().strip())
-            except ValueError:
-                pass
+            acc["folder"] = row["folder_entry"].get().strip()
+            if row.get("accid"):
+                acc["accid"] = row["accid"]
             raw_uids = row["uid_entry"].get().strip()
             acc["uplay_ids"] = [u.strip() for u in raw_uids.split(",") if u.strip()]
             try:
