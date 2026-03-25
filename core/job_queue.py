@@ -101,28 +101,43 @@ class JobQueue:
         job.status = JobStatus.PROCESSING
         self._notify_update()
 
-        try:
-            token_ini = self._worker_obj.generate_token(
-                account_number=job.account_number,
-                token_req=job.token_req,
-            )
-            job.token_ini = token_ini
-            job.status = JobStatus.DONE
-            job.finished_at = datetime.utcnow()
-            self._quota.record(job.account_email, job.uplay_id)
-            logger.info(f"Job {job.id} completed successfully")
+        # Build list of accounts to try: primary first, then fallbacks
+        all_accounts = get_accounts_for_uplay_id(job.uplay_id)
+        accounts_to_try = [{"number": job.account_number, "email": job.account_email}]
+        for acc in all_accounts:
+            if acc["email"] != job.account_email and self._quota.can_generate(acc["email"], job.uplay_id):
+                accounts_to_try.append(acc)
 
-        except DenuvoWorkerError as e:
-            job.status = JobStatus.FAILED
-            job.error = str(e)
-            job.finished_at = datetime.utcnow()
-            logger.error(f"Job {job.id} failed: {e}")
+        last_error = None
+        for attempt, acc in enumerate(accounts_to_try):
+            if attempt > 0:
+                logger.info(f"Job {job.id}: Retrying with fallback account {acc['email']}...")
+                job.account_email = acc["email"]
+                job.account_number = acc["number"]
 
-        except Exception as e:
-            job.status = JobStatus.FAILED
-            job.error = str(e)
-            job.finished_at = datetime.utcnow()
-            logger.error(f"Job {job.id} unexpected error: {e}")
+            try:
+                token_ini = self._worker_obj.generate_token(
+                    account_number=acc["number"],
+                    token_req=job.token_req,
+                )
+                job.token_ini = token_ini
+                job.status = JobStatus.DONE
+                job.finished_at = datetime.utcnow()
+                self._quota.record(acc["email"], job.uplay_id)
+                logger.info(f"Job {job.id} completed successfully (account {acc['email']})")
+                self._notify_update()
+                return
+
+            except Exception as e:
+                last_error = e
+                logger.warning(f"Job {job.id}: Account {acc['email']} failed: {e}")
+                continue
+
+        # All accounts failed
+        job.status = JobStatus.FAILED
+        job.error = str(last_error)
+        job.finished_at = datetime.utcnow()
+        logger.error(f"Job {job.id} failed on all accounts: {last_error}")
 
         self._notify_update()
 
