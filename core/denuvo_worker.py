@@ -1,6 +1,7 @@
 import logging
 import os
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -29,6 +30,9 @@ class DenuvoWorker:
         """
         Run DenuvoTicket.exe, select account, feed token_req, return token.ini content.
 
+        Uses cmd.exe to pipe a temp file into the exe so that the .NET app gets a
+        real console handle (avoids System.IO.IOException on Console.CursorTop).
+
         Args:
             account_number: The menu number to select the account (1, 2, etc.)
             token_req: The full token request string (including |uplay_id at the end)
@@ -49,21 +53,37 @@ class DenuvoWorker:
 
         logger.info(f"Starting DenuvoTicket.exe (account #{account_number})...")
 
-        try:
-            working_dir = self._activator_path.parent
+        working_dir = self._activator_path.parent
+        stdout_path = working_dir / "_stdout.tmp"
+        stderr_path = working_dir / "_stderr.tmp"
 
-            result = subprocess.run(
-                [str(self._activator_path)],
-                input=stdin_data,
-                capture_output=True,
-                text=True,
+        # Write input to a temp file, then use cmd /c to pipe it in
+        # This gives the .NET app a real console allocation via cmd.exe
+        stdin_tmp = None
+        try:
+            stdin_tmp = tempfile.NamedTemporaryFile(
+                mode="w", suffix=".txt", dir=str(working_dir),
+                delete=False, encoding="utf-8",
+            )
+            stdin_tmp.write(stdin_data)
+            stdin_tmp.close()
+
+            # Use cmd /c with input redirection + output capture
+            cmd = (
+                f'cmd /c ""{self._activator_path}" < "{stdin_tmp.name}" '
+                f'> "{stdout_path}" 2> "{stderr_path}""'
+            )
+
+            subprocess.run(
+                cmd,
+                shell=True,
                 timeout=self._process_timeout,
                 cwd=str(working_dir),
                 env={**os.environ},
             )
 
-            stdout = result.stdout or ""
-            stderr = result.stderr or ""
+            stdout = stdout_path.read_text(encoding="utf-8", errors="replace") if stdout_path.exists() else ""
+            stderr = stderr_path.read_text(encoding="utf-8", errors="replace") if stderr_path.exists() else ""
 
             logger.debug(f"DenuvoTicket stdout:\n{stdout}")
             if stderr:
@@ -84,6 +104,14 @@ class DenuvoWorker:
             raise DenuvoWorkerError(
                 f"DenuvoTicket.exe not found at {self._activator_path}"
             )
+        finally:
+            # Clean up temp files
+            for p in [stdin_tmp and Path(stdin_tmp.name), stdout_path, stderr_path]:
+                if p and p.exists():
+                    try:
+                        p.unlink()
+                    except Exception:
+                        pass
 
         # Wait briefly for file to be written
         for _ in range(10):
