@@ -1,11 +1,10 @@
 import json
 import logging
 import re
+import subprocess
 import threading
 import time
 from pathlib import Path
-
-import winpty
 
 logger = logging.getLogger("ubitokeer")
 
@@ -55,23 +54,27 @@ class CliWorker:
         collected_output = []
 
         try:
-            pty = winpty.PtyProcess.spawn(
+            proc = subprocess.Popen(
                 cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 cwd=str(folder_path),
             )
 
-            # Background reader thread
+            # Background reader thread for stdout
             stop_event = threading.Event()
 
             def _reader():
                 while not stop_event.is_set():
                     try:
-                        data = pty.read(4096)
+                        data = proc.stdout.read(4096)
                         if data:
-                            collected_output.append(data)
-                            logger.debug(f"PTY: {data.strip()}")
-                    except EOFError:
-                        break
+                            text = data.decode("utf-8", errors="replace")
+                            collected_output.append(text)
+                            logger.debug(f"OUT: {text.strip()}")
+                        elif proc.poll() is not None:
+                            break
                     except Exception:
                         break
 
@@ -86,23 +89,21 @@ class CliWorker:
 
             time.sleep(0.5)
             logger.debug(f"Sending uplay_id: {uplay_id}")
-            pty.write(f"{uplay_id}\r\n")
+            proc.stdin.write(f"{uplay_id}\r\n".encode())
+            proc.stdin.flush()
 
-            # Step 2: Wait for ticket request prompt (DLC IDs appear before this)
+            # Step 2: Wait for ticket request prompt
             if not self._wait_for_text(collected_output, "denuvo ticket request", deadline):
                 raise CliWorkerError("Timed out waiting for ticket request prompt")
 
-            time.sleep(1)
-            logger.debug(f"Sending token_req ({len(token_req)} chars) via clipboard paste...")
-
-            # Use PowerShell to set clipboard, then paste with Ctrl+V
-            self._pty_clipboard_paste(pty, token_req)
-            time.sleep(0.3)
-            pty.write("\r\n")
+            time.sleep(0.5)
+            logger.debug(f"Sending token_req ({len(token_req)} chars)...")
+            proc.stdin.write(f"{token_req}\r\n".encode())
+            proc.stdin.flush()
 
             logger.info("token_req sent, waiting for output...")
 
-            # Step 3: Wait for tokens to appear in output
+            # Step 3: Wait for tokens or failure
             while time.time() < deadline:
                 full = "".join(collected_output)
                 if "DenuvoToken" in full and "OwnershipToken" in full:
@@ -111,7 +112,7 @@ class CliWorker:
                 if "Failure)" in full and "OwnershipListToken" in full:
                     logger.info("Failure detected in output")
                     break
-                if not pty.isalive():
+                if proc.poll() is not None:
                     break
                 time.sleep(1)
 
@@ -129,9 +130,9 @@ class CliWorker:
                 raise CliWorkerError("Account does not own this app")
 
             # Kill if still running
-            if pty.isalive():
+            if proc.poll() is None:
                 try:
-                    pty.terminate()
+                    proc.kill()
                 except Exception:
                     pass
 
@@ -145,31 +146,6 @@ class CliWorker:
         result = self._parse_output(full_output)
         result["console_output"] = full_output
         return result
-
-    @staticmethod
-    def _pty_clipboard_paste(pty, text: str):
-        """Copy text to Windows clipboard via PowerShell, then send Ctrl+V to PTY."""
-        import subprocess
-        # Set clipboard content using PowerShell
-        # Use a temp file to avoid command-line length limits
-        import tempfile
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as f:
-            f.write(text)
-            tmp_path = f.name
-        try:
-            subprocess.run(
-                ["powershell", "-Command", f"Get-Content -Raw '{tmp_path}' | Set-Clipboard"],
-                timeout=10,
-                capture_output=True,
-            )
-        finally:
-            try:
-                Path(tmp_path).unlink()
-            except Exception:
-                pass
-        # Send Ctrl+V to PTY to paste from clipboard
-        time.sleep(0.3)
-        pty.write("\x16")  # Ctrl+V
 
     def _wait_for_text(self, collected: list, text: str, deadline: float) -> bool:
         while time.time() < deadline:
