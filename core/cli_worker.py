@@ -44,11 +44,11 @@ class CliWorker:
 
         logger.info(f"Starting CLI DenuvoTicket (accid={accid[:8]}..., uplay_id={uplay_id})...")
 
-        # Write token_req to temp file so we can feed it reliably
-        token_req_file = folder_path / "_temp_token_req.txt"
-        token_req_file.write_text(token_req, encoding="utf-8")
+        # Write full input (appId + token_req) to temp file for piping
+        input_file = folder_path / "_temp_input.txt"
+        input_file.write_text(f"{uplay_id}\n{token_req}\n", encoding="utf-8")
 
-        # Build command that pipes token_req from file after appId
+        # Build command
         if command_txt.exists():
             base_cmd = command_txt.read_text().strip()
             base_cmd = base_cmd.replace("DenuvoTicket.exe", str(exe_path), 1)
@@ -56,10 +56,14 @@ class CliWorker:
         else:
             base_cmd = f"{exe_path} -remember-me -remember-device -accid {accid} -usefilestore"
 
-        # Use cmd /c with echo + type to feed both inputs
-        # echo <appId> sends the appId, then type sends the token_req content
-        cmd = f'cmd /c "(echo {uplay_id}& type "{token_req_file}") | {base_cmd}"'
-        logger.debug(f"Full command: {cmd[:120]}...")
+        # Write a temp batch file to handle the piping cleanly
+        batch_file = folder_path / "_temp_run.bat"
+        batch_file.write_text(
+            f'@echo off\ntype "{input_file}" | {base_cmd}\n',
+            encoding="utf-8",
+        )
+        cmd = str(batch_file)
+        logger.debug(f"Running batch: {batch_file}")
 
         collected_output = []
 
@@ -129,9 +133,10 @@ class CliWorker:
         except Exception as e:
             raise CliWorkerError(f"Failed to run CLI DenuvoTicket: {e}")
         finally:
-            # Clean up temp file
+            # Clean up temp files
             try:
-                token_req_file.unlink(missing_ok=True)
+                input_file.unlink(missing_ok=True)
+                batch_file.unlink(missing_ok=True)
             except Exception:
                 pass
 
