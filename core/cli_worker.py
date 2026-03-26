@@ -58,6 +58,7 @@ class CliWorker:
             pty = winpty.PtyProcess.spawn(
                 cmd,
                 cwd=str(folder_path),
+                dimensions=(25, 5000),  # Wide terminal to prevent line wrapping
             )
 
             # Background reader thread
@@ -93,16 +94,11 @@ class CliWorker:
                 raise CliWorkerError("Timed out waiting for ticket request prompt")
 
             time.sleep(1)
-            logger.info(f"Sending token_req ({len(token_req)} chars) in small chunks...")
+            logger.info(f"Sending token_req ({len(token_req)} chars)...")
 
-            # Write in very small chunks with delays to avoid PTY corruption
-            chunk_size = 32
-            for i in range(0, len(token_req), chunk_size):
-                chunk = token_req[i:i + chunk_size]
-                pty.write(chunk)
-                time.sleep(0.15)
-
-            time.sleep(0.5)
+            # Send token_req in one write — wide PTY prevents line-wrap corruption
+            pty.write(token_req)
+            time.sleep(1)
             pty.write("\r\n")
             logger.info("token_req sent, waiting for output...")
 
