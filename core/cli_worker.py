@@ -107,7 +107,7 @@ class CliWorker:
             # Step 3: Wait for tokens or failure
             while time.time() < deadline:
                 full = "".join(collected_output)
-                if "DenuvoToken" in full and "OwnershipToken" in full:
+                if ("DenuvoToken" in full or "GameToken" in full) and ("OwnershipToken" in full or "OwnershipListToken" in full):
                     logger.info("Tokens detected in output")
                     break
                 if "Failure)" in full and "OwnershipListToken" in full:
@@ -167,10 +167,10 @@ class CliWorker:
         if not dlc_ids:
             raise CliWorkerError("Parsed DLC IDs list is empty")
 
-        # Parse DenuvoToken
-        denuvo_match = re.search(r"DenuvoToken[:\s]+([A-Za-z0-9_\-+=/.]+)", output)
+        # Parse DenuvoToken (may appear as "GameToken" or "DenuvoToken")
+        denuvo_match = re.search(r"(?:DenuvoToken|GameToken)[:\s]+([A-Za-z0-9_\-+=/.]+)", output)
         if not denuvo_match:
-            raise CliWorkerError("Could not find DenuvoToken in output")
+            raise CliWorkerError("Could not find DenuvoToken/GameToken in output")
         denuvo_token = denuvo_match.group(1).strip()
 
         # Parse OwnershipToken (might be "OwnershipToken" or "OwnershipListToken")
