@@ -94,10 +94,12 @@ class CliWorker:
                 raise CliWorkerError("Timed out waiting for ticket request prompt")
 
             time.sleep(1)
-            logger.info(f"Sending token_req ({len(token_req)} chars)...")
+            # Strip metadata after | (e.g. "base64data|1081" -> "base64data")
+            clean_token_req = token_req.split("|")[0] if "|" in token_req else token_req
+            logger.info(f"Sending token_req ({len(clean_token_req)} chars, stripped from {len(token_req)})...")
 
             # Send token_req in one write — wide PTY prevents line-wrap corruption
-            pty.write(token_req)
+            pty.write(clean_token_req)
             time.sleep(1)
             pty.write("\r\n")
             logger.info("token_req sent, waiting for output...")
