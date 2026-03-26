@@ -50,6 +50,8 @@ class CliWorker:
             # Use command from command.txt if it exists, otherwise build default
             if command_txt.exists():
                 cmd = command_txt.read_text().strip()
+                # Replace relative DenuvoTicket.exe with full path
+                cmd = cmd.replace("DenuvoTicket.exe", str(exe_path), 1)
                 logger.info(f"Using command from command.txt: {cmd[:80]}...")
             else:
                 cmd = f"{exe_path} -remember-me -remember-device -accid {accid} -usefilestore"
