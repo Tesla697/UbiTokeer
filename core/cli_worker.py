@@ -127,6 +127,9 @@ class CliWorker:
             if "Authentication failed" in full_output:
                 raise CliWorkerError("Authentication failed — account credentials may be invalid")
 
+            if "ExceededActivations" in full_output:
+                raise CliWorkerError("Account has exceeded its activation limit")
+
             if "You are not owning this App" in full_output:
                 raise CliWorkerError("Account does not own this app")
 
