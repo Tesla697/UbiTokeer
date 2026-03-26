@@ -37,6 +37,7 @@ class CliWorker:
         """
         folder_path = Path(folder).resolve()
         exe_path = folder_path / "DenuvoTicket.exe"
+        command_txt = folder_path / "command.txt"
 
         if not exe_path.exists():
             raise CliWorkerError(f"DenuvoTicket.exe not found at {exe_path}")
@@ -46,7 +47,12 @@ class CliWorker:
         collected_output = []
 
         try:
-            cmd = f"{exe_path} -remember-me -remember-device -accid {accid} -usefilestore"
+            # Use command from command.txt if it exists, otherwise build default
+            if command_txt.exists():
+                cmd = command_txt.read_text().strip()
+                logger.info(f"Using command from command.txt: {cmd[:80]}...")
+            else:
+                cmd = f"{exe_path} -remember-me -remember-device -accid {accid} -usefilestore"
             pty = winpty.PtyProcess.spawn(
                 cmd,
                 cwd=str(folder_path),
@@ -85,8 +91,13 @@ class CliWorker:
                 raise CliWorkerError("Timed out waiting for ticket request prompt")
 
             time.sleep(0.5)
-            logger.debug("Sending token_req...")
-            pty.write(f"{token_req}\r\n")
+            logger.debug(f"Sending token_req ({len(token_req)} chars)...")
+            # Write in chunks to avoid PTY buffer overflow
+            chunk_size = 512
+            for i in range(0, len(token_req), chunk_size):
+                pty.write(token_req[i:i + chunk_size])
+                time.sleep(0.05)
+            pty.write("\r\n")
 
             # Step 3: Wait for tokens to appear in output
             while time.time() < deadline:
