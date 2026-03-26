@@ -22,7 +22,7 @@ class CliWorker:
     Everything is parsed from console output.
     """
 
-    def __init__(self, process_timeout: int = 90):
+    def __init__(self, process_timeout: int = 120):
         self._process_timeout = process_timeout
 
     def generate(self, folder: str, accid: str, uplay_id: str, token_req: str) -> dict:
@@ -44,26 +44,13 @@ class CliWorker:
 
         logger.info(f"Starting CLI DenuvoTicket (accid={accid[:8]}..., uplay_id={uplay_id})...")
 
-        # Write full input (appId + token_req) to temp file for piping
-        input_file = folder_path / "_temp_input.txt"
-        input_file.write_text(f"{uplay_id}\n{token_req}\n", encoding="utf-8")
-
         # Build command
         if command_txt.exists():
-            base_cmd = command_txt.read_text().strip()
-            base_cmd = base_cmd.replace("DenuvoTicket.exe", str(exe_path), 1)
-            logger.info(f"Using command from command.txt: {base_cmd[:80]}...")
+            cmd = command_txt.read_text().strip()
+            cmd = cmd.replace("DenuvoTicket.exe", str(exe_path), 1)
+            logger.info(f"Using command from command.txt: {cmd[:80]}...")
         else:
-            base_cmd = f"{exe_path} -remember-me -remember-device -accid {accid} -usefilestore"
-
-        # Write a temp batch file to handle the piping cleanly
-        batch_file = folder_path / "_temp_run.bat"
-        batch_file.write_text(
-            f'@echo off\ntype "{input_file}" | {base_cmd}\n',
-            encoding="utf-8",
-        )
-        cmd = str(batch_file)
-        logger.debug(f"Running batch: {batch_file}")
+            cmd = f"{exe_path} -remember-me -remember-device -accid {accid} -usefilestore"
 
         collected_output = []
 
@@ -93,14 +80,34 @@ class CliWorker:
 
             deadline = time.time() + self._process_timeout
 
-            # Wait for process to complete or timeout
+            # Step 1: Wait for appId prompt
+            if not self._wait_for_text(collected_output, "appId", deadline):
+                raise CliWorkerError("Timed out waiting for appId prompt")
+
+            time.sleep(0.5)
+            logger.debug(f"Sending uplay_id: {uplay_id}")
+            pty.write(f"{uplay_id}\r\n")
+
+            # Step 2: Wait for ticket request prompt (DLC IDs appear before this)
+            if not self._wait_for_text(collected_output, "denuvo ticket request", deadline):
+                raise CliWorkerError("Timed out waiting for ticket request prompt")
+
+            time.sleep(1)
+            logger.debug(f"Sending token_req ({len(token_req)} chars) via clipboard paste...")
+
+            # Use PowerShell to set clipboard, then paste with Ctrl+V
+            self._pty_clipboard_paste(pty, token_req)
+            time.sleep(0.3)
+            pty.write("\r\n")
+
+            logger.info("token_req sent, waiting for output...")
+
+            # Step 3: Wait for tokens to appear in output
             while time.time() < deadline:
                 full = "".join(collected_output)
-                # Check if we have tokens in output
                 if "DenuvoToken" in full and "OwnershipToken" in full:
                     logger.info("Tokens detected in output")
                     break
-                # Check for known failures
                 if "Failure)" in full and "OwnershipListToken" in full:
                     logger.info("Failure detected in output")
                     break
@@ -132,19 +139,45 @@ class CliWorker:
             raise
         except Exception as e:
             raise CliWorkerError(f"Failed to run CLI DenuvoTicket: {e}")
-        finally:
-            # Clean up temp files
-            try:
-                input_file.unlink(missing_ok=True)
-                batch_file.unlink(missing_ok=True)
-            except Exception:
-                pass
 
         # Parse the output
         full_output = "".join(collected_output)
         result = self._parse_output(full_output)
         result["console_output"] = full_output
         return result
+
+    @staticmethod
+    def _pty_clipboard_paste(pty, text: str):
+        """Copy text to Windows clipboard via PowerShell, then send Ctrl+V to PTY."""
+        import subprocess
+        # Set clipboard content using PowerShell
+        # Use a temp file to avoid command-line length limits
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as f:
+            f.write(text)
+            tmp_path = f.name
+        try:
+            subprocess.run(
+                ["powershell", "-Command", f"Get-Content -Raw '{tmp_path}' | Set-Clipboard"],
+                timeout=10,
+                capture_output=True,
+            )
+        finally:
+            try:
+                Path(tmp_path).unlink()
+            except Exception:
+                pass
+        # Send Ctrl+V to PTY to paste from clipboard
+        time.sleep(0.3)
+        pty.write("\x16")  # Ctrl+V
+
+    def _wait_for_text(self, collected: list, text: str, deadline: float) -> bool:
+        while time.time() < deadline:
+            full = "".join(collected)
+            if text.lower() in full.lower():
+                return True
+            time.sleep(0.5)
+        return False
 
     def _parse_output(self, output: str) -> dict:
         # Parse DLC IDs from "Your owned product Associations: 918, 5900, ..."
