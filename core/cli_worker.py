@@ -1,10 +1,11 @@
 import json
 import logging
 import re
-import subprocess
 import threading
 import time
 from pathlib import Path
+
+import winpty
 
 logger = logging.getLogger("ubitokeer")
 
@@ -54,27 +55,23 @@ class CliWorker:
         collected_output = []
 
         try:
-            proc = subprocess.Popen(
+            pty = winpty.PtyProcess.spawn(
                 cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
                 cwd=str(folder_path),
             )
 
-            # Background reader thread for stdout
+            # Background reader thread
             stop_event = threading.Event()
 
             def _reader():
                 while not stop_event.is_set():
                     try:
-                        data = proc.stdout.read(4096)
+                        data = pty.read(4096)
                         if data:
-                            text = data.decode("utf-8", errors="replace")
-                            collected_output.append(text)
-                            logger.debug(f"OUT: {text.strip()}")
-                        elif proc.poll() is not None:
-                            break
+                            collected_output.append(data)
+                            logger.debug(f"PTY: {data.strip()}")
+                    except EOFError:
+                        break
                     except Exception:
                         break
 
@@ -89,18 +86,24 @@ class CliWorker:
 
             time.sleep(0.5)
             logger.debug(f"Sending uplay_id: {uplay_id}")
-            proc.stdin.write(f"{uplay_id}\r\n".encode())
-            proc.stdin.flush()
+            pty.write(f"{uplay_id}\r\n")
 
-            # Step 2: Wait for ticket request prompt
+            # Step 2: Wait for ticket request prompt (DLC IDs appear before this)
             if not self._wait_for_text(collected_output, "denuvo ticket request", deadline):
                 raise CliWorkerError("Timed out waiting for ticket request prompt")
 
-            time.sleep(0.5)
-            logger.debug(f"Sending token_req ({len(token_req)} chars)...")
-            proc.stdin.write(f"{token_req}\r\n".encode())
-            proc.stdin.flush()
+            time.sleep(1)
+            logger.info(f"Sending token_req ({len(token_req)} chars) in small chunks...")
 
+            # Write in very small chunks with delays to avoid PTY corruption
+            chunk_size = 32
+            for i in range(0, len(token_req), chunk_size):
+                chunk = token_req[i:i + chunk_size]
+                pty.write(chunk)
+                time.sleep(0.15)
+
+            time.sleep(0.5)
+            pty.write("\r\n")
             logger.info("token_req sent, waiting for output...")
 
             # Step 3: Wait for tokens or failure
@@ -112,7 +115,7 @@ class CliWorker:
                 if "Failure)" in full and "OwnershipListToken" in full:
                     logger.info("Failure detected in output")
                     break
-                if proc.poll() is not None:
+                if not pty.isalive():
                     break
                 time.sleep(1)
 
@@ -130,9 +133,9 @@ class CliWorker:
                 raise CliWorkerError("Account does not own this app")
 
             # Kill if still running
-            if proc.poll() is None:
+            if pty.isalive():
                 try:
-                    proc.kill()
+                    pty.terminate()
                 except Exception:
                     pass
 
