@@ -25,7 +25,7 @@ def get_account_for_uplay_id(uplay_id: str, quota) -> dict | None:
     accounts = read_accounts()
     for acc in accounts:
         if uplay_id in acc.get("uplay_ids", []):
-            if quota.can_generate(acc["email"], uplay_id):
+            if not acc.get("track_quota", True) or quota.can_generate(acc["email"], uplay_id):
                 return acc
     return None
 

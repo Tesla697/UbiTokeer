@@ -111,7 +111,7 @@ class JobQueue:
         all_accounts = get_accounts_for_uplay_id(job.uplay_id)
         accounts_to_try = [{"email": job.account_email, "accid": job.accid, "folder": job.folder}]
         for acc in all_accounts:
-            if acc["email"] != job.account_email and self._quota.can_generate(acc["email"], job.uplay_id):
+            if acc["email"] != job.account_email and (not acc.get("track_quota", True) or self._quota.can_generate(acc["email"], job.uplay_id)):
                 accounts_to_try.append(acc)
 
         last_error = None
@@ -148,7 +148,8 @@ class JobQueue:
 
                 job.status = JobStatus.DONE
                 job.finished_at = datetime.utcnow()
-                self._quota.record(acc["email"], job.uplay_id)
+                if acc.get("track_quota", True):
+                    self._quota.record(acc["email"], job.uplay_id)
                 logger.info(f"Job {job.id} completed successfully (account {acc['email']}, format={output_format})")
                 self._notify_update()
                 return
