@@ -113,6 +113,15 @@ class CliWorker:
                 if "Failure)" in full and "OwnershipListToken" in full:
                     logger.info("Failure detected in output")
                     break
+                if "ExceededActivations" in full:
+                    logger.info("ExceededActivations detected in output")
+                    break
+                if "Authentication failed" in full:
+                    logger.info("Authentication failure detected in output")
+                    break
+                if "You are not owning this App" in full:
+                    logger.info("App not owned detected in output")
+                    break
                 if not pty.isalive():
                     break
                 time.sleep(1)
