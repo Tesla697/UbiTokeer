@@ -1,8 +1,11 @@
 import json
 import logging
 import re
-import subprocess
+import threading
+import time
 from pathlib import Path
+
+import winpty
 
 logger = logging.getLogger("ubitokeer")
 
@@ -41,43 +44,99 @@ class CliWorker:
 
         logger.info(f"Starting CLI DenuvoTicket (accid={accid[:8]}..., uplay_id={uplay_id})...")
 
-        # Build command
-        if command_txt.exists():
-            cmd = command_txt.read_text().strip()
-            # Replace relative DenuvoTicket.exe with full path
-            cmd = cmd.replace("DenuvoTicket.exe", str(exe_path), 1)
-            logger.info(f"Using command from command.txt: {cmd[:80]}...")
-        else:
-            cmd = f"{exe_path} -remember-me -remember-device -accid {accid} -usefilestore"
+        # Write token_req to temp file so we can feed it reliably
+        token_req_file = folder_path / "_temp_token_req.txt"
+        token_req_file.write_text(token_req, encoding="utf-8")
 
-        # Prepare stdin: appId + token_req
-        stdin_data = f"{uplay_id}\n{token_req}\n"
-        logger.debug(f"Sending stdin: uplay_id={uplay_id}, token_req={len(token_req)} chars")
+        # Build command that pipes token_req from file after appId
+        if command_txt.exists():
+            base_cmd = command_txt.read_text().strip()
+            base_cmd = base_cmd.replace("DenuvoTicket.exe", str(exe_path), 1)
+            logger.info(f"Using command from command.txt: {base_cmd[:80]}...")
+        else:
+            base_cmd = f"{exe_path} -remember-me -remember-device -accid {accid} -usefilestore"
+
+        # Use cmd /c with echo + type to feed both inputs
+        # echo <appId> sends the appId, then type sends the token_req content
+        cmd = f'cmd /c "(echo {uplay_id}& type "{token_req_file}") | {base_cmd}"'
+        logger.debug(f"Full command: {cmd[:120]}...")
+
+        collected_output = []
 
         try:
-            proc = subprocess.run(
+            pty = winpty.PtyProcess.spawn(
                 cmd,
-                input=stdin_data,
-                capture_output=True,
-                text=True,
                 cwd=str(folder_path),
-                timeout=self._process_timeout,
             )
-            full_output = proc.stdout + "\n" + proc.stderr
+
+            # Background reader thread
+            stop_event = threading.Event()
+
+            def _reader():
+                while not stop_event.is_set():
+                    try:
+                        data = pty.read(4096)
+                        if data:
+                            collected_output.append(data)
+                            logger.debug(f"PTY: {data.strip()}")
+                    except EOFError:
+                        break
+                    except Exception:
+                        break
+
+            reader_thread = threading.Thread(target=_reader, daemon=True)
+            reader_thread.start()
+
+            deadline = time.time() + self._process_timeout
+
+            # Wait for process to complete or timeout
+            while time.time() < deadline:
+                full = "".join(collected_output)
+                # Check if we have tokens in output
+                if "DenuvoToken" in full and "OwnershipToken" in full:
+                    logger.info("Tokens detected in output")
+                    break
+                # Check for known failures
+                if "Failure)" in full and "OwnershipListToken" in full:
+                    logger.info("Failure detected in output")
+                    break
+                if not pty.isalive():
+                    break
+                time.sleep(1)
+
+            # Give it a moment to finish output
+            time.sleep(2)
+            stop_event.set()
+
+            full_output = "".join(collected_output)
             logger.debug(f"CLI full output:\n{full_output}")
 
-        except subprocess.TimeoutExpired:
-            raise CliWorkerError(f"Process timed out after {self._process_timeout}s")
+            if "Authentication failed" in full_output:
+                raise CliWorkerError("Authentication failed — account credentials may be invalid")
+
+            if "You are not owning this App" in full_output:
+                raise CliWorkerError("Account does not own this app")
+
+            # Kill if still running
+            if pty.isalive():
+                try:
+                    pty.terminate()
+                except Exception:
+                    pass
+
+        except CliWorkerError:
+            raise
         except Exception as e:
             raise CliWorkerError(f"Failed to run CLI DenuvoTicket: {e}")
-
-        if "Authentication failed" in full_output:
-            raise CliWorkerError("Authentication failed — account credentials may be invalid")
-
-        if "You are not owning this App" in full_output:
-            raise CliWorkerError("Account does not own this app")
+        finally:
+            # Clean up temp file
+            try:
+                token_req_file.unlink(missing_ok=True)
+            except Exception:
+                pass
 
         # Parse the output
+        full_output = "".join(collected_output)
         result = self._parse_output(full_output)
         result["console_output"] = full_output
         return result
