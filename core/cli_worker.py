@@ -70,7 +70,10 @@ class CliWorker:
                         data = pty.read(4096)
                         if data:
                             collected_output.append(data)
-                            logger.debug(f"PTY: {data.strip()}")
+                            # Only log short PTY lines to avoid flooding with token data
+                            stripped = data.strip()
+                            if len(stripped) < 200:
+                                logger.debug(f"PTY: {stripped}")
                     except EOFError:
                         break
                     except Exception:

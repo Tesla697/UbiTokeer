@@ -69,7 +69,9 @@ def setup_logging(gui_handler: logging.Handler) -> None:
 
     # Suppress noisy uvicorn logs
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+    logging.getLogger("uvicorn.error").setLevel(logging.CRITICAL)
     logging.getLogger("uvicorn.error").propagate = False
+    logging.getLogger("uvicorn").setLevel(logging.CRITICAL)
 
 
 # ---------------------------------------------------------------------------
