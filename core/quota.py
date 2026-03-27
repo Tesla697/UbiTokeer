@@ -106,7 +106,11 @@ class QuotaTracker:
         now = time.time()
         next_slot_ms = None
 
+        has_untracked = False
         for acc in accounts:
+            if not acc.get("track_quota", True):
+                has_untracked = True
+                continue
             remaining = self.get_remaining(acc["email"], uplay_id)
             total_remaining += remaining
             if remaining == 0:
@@ -116,6 +120,10 @@ class QuotaTracker:
                     reset_in_ms = int((entry["window_start"] + 86400 - now) * 1000)
                     if next_slot_ms is None or reset_in_ms < next_slot_ms:
                         next_slot_ms = max(0, reset_in_ms)
+
+        # Untracked accounts always have tokens available
+        if has_untracked:
+            total_remaining = max(total_remaining, 1)
 
         resets_in = _format_duration(next_slot_ms / 1000) if next_slot_ms else None
         return {
