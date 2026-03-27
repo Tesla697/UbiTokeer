@@ -481,7 +481,7 @@ class UbiTokeerApp(ctk.CTk):
             for email in emails:
                 key = (uid, email)
                 labels = self._quota_labels.get(key)
-                if not labels:
+                if not labels or labels.get("untracked"):
                     continue
                 remaining = self._quota_tracker.get_remaining(email, uid)
                 acc_data = next((a for a in accounts if a["email"] == email), {})
@@ -532,14 +532,33 @@ class UbiTokeerApp(ctk.CTk):
 
             for i, email in enumerate(emails, start=1):
                 acc = next((a for a in accounts if a["email"] == email), {})
+                track = acc.get("track_quota", True)
                 daily_limit = acc.get("daily_limit", 5)
-                remaining = self._quota_tracker.get_remaining(email, uid)
-                used = daily_limit - remaining
 
                 display_name = acc.get("name") or email
                 ctk.CTkLabel(table, text=display_name, anchor="w").grid(
                     row=i, column=0, sticky="w", padx=6, pady=1
                 )
+
+                if not track:
+                    # Untracked account — show "Untracked" instead of quota
+                    lbl_used = ctk.CTkLabel(
+                        table, text="Untracked", anchor="w",
+                        text_color="#888888"
+                    )
+                    lbl_used.grid(row=i, column=1, sticky="w", padx=6, pady=1)
+                    lbl_resets = ctk.CTkLabel(table, text="\u2014", anchor="w")
+                    lbl_resets.grid(row=i, column=2, sticky="w", padx=6, pady=1)
+                    self._quota_labels[(uid, email)] = {
+                        "used": lbl_used,
+                        "resets": lbl_resets,
+                        "untracked": True,
+                    }
+                    # No +/- buttons for untracked
+                    continue
+
+                remaining = self._quota_tracker.get_remaining(email, uid)
+                used = daily_limit - remaining
 
                 used_color = "#ff5555" if remaining == 0 else "#ffffff"
                 lbl_used = ctk.CTkLabel(
@@ -564,6 +583,7 @@ class UbiTokeerApp(ctk.CTk):
                 self._quota_labels[(uid, email)] = {
                     "used": lbl_used,
                     "resets": lbl_resets,
+                    "untracked": False,
                 }
 
                 btn_frame = ctk.CTkFrame(table, fg_color="transparent")

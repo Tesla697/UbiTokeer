@@ -141,10 +141,22 @@ class QuotaTracker:
                 acc_details = []
                 total_used = 0
                 for acc in accs:
+                    track = acc.get("track_quota", True)
                     key = self._key(acc["email"], uplay_id)
                     entry = self._data.get(key)
                     if entry and now > entry["window_start"] + 86400:
                         entry = None
+                    if not track:
+                        # Untracked account — don't show quota numbers
+                        acc_details.append({
+                            "email": acc["email"],
+                            "used": -1,
+                            "remaining": -1,
+                            "window_resets_at": None,
+                            "resets_in": None,
+                            "track_quota": False,
+                        })
+                        continue
                     used = entry["count"] if entry else 0
                     remaining = max(0, self._daily_limit - used)
                     resets_at = (
@@ -162,6 +174,7 @@ class QuotaTracker:
                         "remaining": remaining,
                         "window_resets_at": resets_at,
                         "resets_in": resets_in,
+                        "track_quota": True,
                     })
 
                 total_remaining = sum(a["remaining"] for a in acc_details)
