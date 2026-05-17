@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -53,6 +54,9 @@ class CliWorker:
             cmd = f"{exe_path} -remember-me -remember-device -accid {accid} -usefilestore"
 
         collected_output = []
+        pty = None
+        stop_event = threading.Event()
+        reader_thread = None
 
         try:
             pty = winpty.PtyProcess.spawn(
@@ -62,8 +66,6 @@ class CliWorker:
             )
 
             # Background reader thread
-            stop_event = threading.Event()
-
             def _reader():
                 while not stop_event.is_set():
                     try:
@@ -131,7 +133,6 @@ class CliWorker:
 
             # Give it a moment to finish output
             time.sleep(2)
-            stop_event.set()
 
             full_output = "".join(collected_output)
             logger.debug(f"CLI full output:\n{full_output}")
@@ -145,23 +146,60 @@ class CliWorker:
             if "You are not owning this App" in full_output:
                 raise CliWorkerError("Account does not own this app")
 
-            # Kill if still running
-            if pty.isalive():
-                try:
-                    pty.terminate()
-                except Exception:
-                    pass
-
         except CliWorkerError:
             raise
         except Exception as e:
             raise CliWorkerError(f"Failed to run CLI DenuvoTicket: {e}")
+        finally:
+            stop_event.set()
+            self._stop_pty(pty)
+            if reader_thread and reader_thread.is_alive():
+                reader_thread.join(timeout=2)
+            self._kill_leftover_processes(exe_path)
 
         # Parse the output
         full_output = "".join(collected_output)
         result = self._parse_output(full_output)
         result["console_output"] = full_output
         return result
+
+    def _stop_pty(self, pty) -> None:
+        if not pty:
+            return
+        try:
+            if pty.isalive():
+                pty.terminate()
+        except Exception:
+            pass
+        try:
+            close = getattr(pty, "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            pass
+
+    def _kill_leftover_processes(self, exe_path: Path) -> None:
+        """Kill leaked DenuvoTicket.exe instances from this worker folder only."""
+        exe_path_text = str(exe_path.resolve())
+        ps_exe_path = exe_path_text.replace("'", "''")
+        ps = (
+            "$target = '" + ps_exe_path + "'; "
+            "Get-CimInstance Win32_Process -Filter \"Name = 'DenuvoTicket.exe'\" | "
+            "Where-Object { $_.ExecutablePath -eq $target } | "
+            "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+        )
+        try:
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if result.returncode != 0:
+                logger.debug(f"DenuvoTicket cleanup returned {result.returncode}: {result.stderr.strip()}")
+        except Exception as e:
+            logger.warning(f"Failed to clean leaked DenuvoTicket processes for {exe_path_text}: {e}")
 
     def _wait_for_text(self, collected: list, text: str, deadline: float) -> bool:
         while time.time() < deadline:
