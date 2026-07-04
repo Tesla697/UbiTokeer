@@ -493,7 +493,7 @@ class UbiTokeerApp(ctk.CTk):
                 # Calculate resets_in
                 q_key = self._quota_tracker._key(email, uid)
                 entry = self._quota_tracker._data.get(q_key)
-                if entry and remaining == 0:
+                if entry:
                     reset_secs = entry["window_start"] + 86400 - now
                     if reset_secs > 0:
                         from core.quota import _format_duration
@@ -571,7 +571,7 @@ class UbiTokeerApp(ctk.CTk):
                 q_key = self._quota_tracker._key(email, uid)
                 entry = self._quota_tracker._data.get(q_key)
                 resets_text = "\u2014"
-                if entry and remaining == 0:
+                if entry:
                     reset_secs = entry["window_start"] + 86400 - now
                     if reset_secs > 0:
                         from core.quota import _format_duration
