@@ -22,14 +22,34 @@ def set_queue(queue: JobQueue) -> None:
 
 class JobRequest(BaseModel):
     uplay_id: str
+    # Optional so a pure reservation (defer=True) can be made before the user has
+    # produced their token request file. A normal immediate generate still sends it.
+    token_req: str = ""
+    # When True, hold a quota slot but DON'T generate yet — the bot opens the
+    # ticket first, then calls /job/{id}/activate once the token_req arrives.
+    defer: bool = False
+
+
+class ActivateRequest(BaseModel):
     token_req: str
+
+
+class CancelRequest(BaseModel):
+    reason: str = ""
 
 
 @app.post("/request")
 def submit_request(body: JobRequest):
-    logger.info(f"API: POST /request uplay_id={body.uplay_id}")
+    logger.info(f"API: POST /request uplay_id={body.uplay_id} defer={body.defer}")
     try:
-        job = _queue.submit(body.uplay_id, body.token_req)
+        if body.defer:
+            # Admission gate: reserve a slot only. 429 here means the pool is full,
+            # and the bot refuses to even open the ticket.
+            job = _queue.reserve(body.uplay_id)
+        else:
+            if not body.token_req:
+                return JSONResponse(status_code=400, content={"error": "token_req required"})
+            job = _queue.submit(body.uplay_id, body.token_req)
         return {"job_id": job.id, "status": job.status.value}
     except QuotaExceededError as e:
         logger.warning(f"API: Quota exceeded — {e}")
@@ -53,6 +73,31 @@ def get_job(job_id: str):
     return job.to_dict()
 
 
+@app.post("/job/{job_id}/activate")
+def activate_job(job_id: str, body: ActivateRequest):
+    """Promote a deferred RESERVED job to QUEUED, handing over the token request."""
+    logger.info(f"API: POST /job/{job_id}/activate")
+    try:
+        job = _queue.activate(job_id, body.token_req)
+        return {"job_id": job.id, "status": job.status.value}
+    except BusyError as e:
+        return JSONResponse(status_code=503, content={"error": str(e)})
+    except ValueError as e:
+        return JSONResponse(status_code=404, content={"error": str(e)})
+    except Exception as e:
+        logger.error(f"API: activate error — {e}")
+        return JSONResponse(status_code=500, content={"error": "Internal server error"})
+
+
+@app.post("/job/{job_id}/cancel")
+def cancel_job(job_id: str, body: CancelRequest | None = None):
+    """Release a held reservation (ticket closed/abandoned before generation)."""
+    reason = body.reason if body else ""
+    logger.info(f"API: POST /job/{job_id}/cancel reason={reason}")
+    released = _queue.cancel(job_id, reason)
+    return {"job_id": job_id, "released": released}
+
+
 @app.get("/quota")
 def get_quota():
     return _queue.get_quota_summary()
@@ -68,9 +113,19 @@ def get_status():
     state = _queue.get_state()
     current = state["current"]
     pending = state["pending"]
+    reservations = _queue.get_reservations()
     return {
         "status": "busy" if current else "idle",
-        "queue_size": (1 if pending else 0),
+        "queue_size": state.get("pending_count", 1 if pending else 0),
         "current_job": current,
         "pending_job": pending,
+        # Slots held by open tickets that haven't uploaded a token_req yet.
+        "reservations_total": reservations["total"],
+        "reservations_by_uplay": reservations["by_uplay"],
     }
+
+
+@app.get("/reservations")
+def get_reservations():
+    """Just the live reservation snapshot: {total, by_uplay}."""
+    return _queue.get_reservations()

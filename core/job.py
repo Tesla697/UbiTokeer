@@ -5,6 +5,10 @@ from typing import Optional
 
 
 class JobStatus(Enum):
+    # RESERVED: a quota slot is held for this job but no token has been generated
+    # yet. The bot creates one of these the moment a user opens a ticket, then
+    # promotes it to QUEUED via /job/{id}/activate once the token_req file arrives.
+    RESERVED = "reserved"
     QUEUED = "queued"
     PROCESSING = "processing"
     DONE = "done"

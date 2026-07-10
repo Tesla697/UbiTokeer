@@ -40,10 +40,47 @@ class QuotaTracker:
         self._data: dict = {}
         self._lock = threading.Lock()
         self._daily_limit = daily_limit
+        # Live slot reservations: job_id -> {account_email, uplay_id, created_at}.
+        # A reservation holds one slot for an (account, uplay_id) pair without
+        # having generated a token yet, so it counts against "remaining" exactly
+        # like a used slot until it's released (activated+recorded, cancelled, or
+        # swept for being stale). This is what stops the pool from being oversold
+        # when many users open tickets at once.
+        self._reservations: dict[str, dict] = {}
         self._load()
 
     def _key(self, account_email: str, uplay_id: str) -> str:
         return f"{account_email}:{uplay_id}"
+
+    # ---- lock-held helpers (caller must hold self._lock) ----
+    def _used_locked(self, account_email: str, uplay_id: str) -> int:
+        key = self._key(account_email, uplay_id)
+        entry = self._data.get(key)
+        if not entry:
+            return 0
+        if time.time() > entry["window_start"] + 86400:
+            del self._data[key]
+            return 0
+        return entry["count"]
+
+    def _reserved_locked(self, account_email: str, uplay_id: str) -> int:
+        return sum(
+            1 for r in self._reservations.values()
+            if r["account_email"] == account_email and r["uplay_id"] == uplay_id
+        )
+
+    def reserved_for_uplay(self, uplay_id: str) -> int:
+        """How many slots are currently held (reserved, not yet generated) for a game."""
+        with self._lock:
+            return sum(1 for r in self._reservations.values() if r["uplay_id"] == uplay_id)
+
+    def reservations_snapshot(self) -> dict:
+        """{'total': N, 'by_uplay': {uplay_id: count}} of all live reservations."""
+        with self._lock:
+            by_uplay: dict[str, int] = {}
+            for r in self._reservations.values():
+                by_uplay[r["uplay_id"]] = by_uplay.get(r["uplay_id"], 0) + 1
+            return {"total": len(self._reservations), "by_uplay": by_uplay}
 
     def _load(self) -> None:
         if QUOTA_PATH.exists():
@@ -62,17 +99,68 @@ class QuotaTracker:
 
     def get_remaining(self, account_email: str, uplay_id: str) -> int:
         with self._lock:
-            key = self._key(account_email, uplay_id)
-            entry = self._data.get(key)
-            if not entry:
-                return self._daily_limit
-            if time.time() > entry["window_start"] + 86400:
-                del self._data[key]
-                return self._daily_limit
-            return max(0, self._daily_limit - entry["count"])
+            used = self._used_locked(account_email, uplay_id)
+            reserved = self._reserved_locked(account_email, uplay_id)
+            return max(0, self._daily_limit - used - reserved)
 
     def can_generate(self, account_email: str, uplay_id: str) -> bool:
         return self.get_remaining(account_email, uplay_id) > 0
+
+    def try_reserve(self, job_id: str, accounts: list[dict], uplay_id: str) -> str | None:
+        """Atomically hold one slot for uplay_id against the first account with room.
+
+        Returns the chosen account email, or None if every tracked account is at
+        its limit (accounting for slots already used AND already reserved). Doing
+        the pick + hold under one lock is what makes concurrent ticket opens safe:
+        two simultaneous reservations can't both grab the same last slot.
+        """
+        with self._lock:
+            for acc in accounts:
+                email = acc["email"]
+                if not acc.get("track_quota", True):
+                    # Untracked account = unlimited; still record the reservation
+                    # so the job has a hold to release later, but it never blocks.
+                    self._reservations[job_id] = {
+                        "account_email": email, "uplay_id": uplay_id, "created_at": time.time(),
+                    }
+                    return email
+                used = self._used_locked(email, uplay_id)
+                reserved = self._reserved_locked(email, uplay_id)
+                if self._daily_limit - used - reserved > 0:
+                    self._reservations[job_id] = {
+                        "account_email": email, "uplay_id": uplay_id, "created_at": time.time(),
+                    }
+                    logger.info(
+                        f"Quota reserved: {email}:{uplay_id} (job {job_id}) — "
+                        f"{used} used, {reserved + 1} held, "
+                        f"{max(0, self._daily_limit - used - reserved - 1)} free"
+                    )
+                    return email
+            return None
+
+    def release(self, job_id: str) -> bool:
+        """Drop a reservation hold (idempotent). Called on activate-complete,
+        cancel, or sweep. Safe to call for a job that never reserved."""
+        with self._lock:
+            r = self._reservations.pop(job_id, None)
+        if r:
+            logger.info(f"Quota reservation released: job {job_id} ({r['account_email']}:{r['uplay_id']})")
+        return r is not None
+
+    def sweep(self, ttl_seconds: float) -> list[str]:
+        """Release reservations older than ttl_seconds (a crashed/abandoned open
+        that never activated). Returns the swept job_ids."""
+        now = time.time()
+        with self._lock:
+            stale = [
+                jid for jid, r in self._reservations.items()
+                if now - r["created_at"] > ttl_seconds
+            ]
+            for jid in stale:
+                del self._reservations[jid]
+        if stale:
+            logger.info(f"Swept {len(stale)} stale reservation(s): {stale}")
+        return stale
 
     def decrement(self, account_email: str, uplay_id: str) -> None:
         with self._lock:
@@ -129,6 +217,7 @@ class QuotaTracker:
         return {
             "game_name": game_names.get(uplay_id, f"Uplay {uplay_id}"),
             "remaining": total_remaining,
+            "reserved": self.reserved_for_uplay(uplay_id),
             "next_slot_in_ms": next_slot_ms,
             "resets_in": resets_in,
         }
@@ -148,25 +237,30 @@ class QuotaTracker:
             for uplay_id, accs in uplay_map.items():
                 acc_details = []
                 total_used = 0
+                total_reserved = 0
                 for acc in accs:
                     track = acc.get("track_quota", True)
                     key = self._key(acc["email"], uplay_id)
                     entry = self._data.get(key)
                     if entry and now > entry["window_start"] + 86400:
                         entry = None
+                    acc_reserved = self._reserved_locked(acc["email"], uplay_id)
+                    total_reserved += acc_reserved
                     if not track:
-                        # Untracked account — don't show quota numbers
+                        # Untracked account — don't show quota numbers (but do show holds)
                         acc_details.append({
                             "email": acc["email"],
                             "used": -1,
                             "remaining": -1,
+                            "reserved": acc_reserved,
                             "window_resets_at": None,
                             "resets_in": None,
                             "track_quota": False,
                         })
                         continue
                     used = entry["count"] if entry else 0
-                    remaining = max(0, self._daily_limit - used)
+                    reserved = acc_reserved
+                    remaining = max(0, self._daily_limit - used - reserved)
                     resets_at = (
                         datetime.fromtimestamp(
                             entry["window_start"] + 86400, tz=timezone.utc
@@ -180,16 +274,18 @@ class QuotaTracker:
                         "email": acc["email"],
                         "used": used,
                         "remaining": remaining,
+                        "reserved": reserved,
                         "window_resets_at": resets_at,
                         "resets_in": resets_in,
                         "track_quota": True,
                     })
 
-                total_remaining = sum(a["remaining"] for a in acc_details)
+                total_remaining = sum(a["remaining"] for a in acc_details if a["remaining"] >= 0)
                 result[uplay_id] = {
                     "game_name": game_names.get(uplay_id, f"Uplay {uplay_id}"),
                     "total_used": total_used,
                     "total_remaining": total_remaining,
+                    "total_reserved": total_reserved,
                     "limit_per_account": self._daily_limit,
                     "accounts": acc_details,
                 }
