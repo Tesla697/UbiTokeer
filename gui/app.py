@@ -483,12 +483,13 @@ class UbiTokeerApp(ctk.CTk):
                 labels = self._quota_labels.get(key)
                 if not labels or labels.get("untracked"):
                     continue
-                remaining = self._quota_tracker.get_remaining(email, uid)
                 acc_data = next((a for a in accounts if a["email"] == email), {})
                 daily_limit = acc_data.get("daily_limit", 5)
-                used = daily_limit - remaining
-                used_color = "#ff5555" if remaining == 0 else "#ffffff"
-                labels["used"].configure(text=f"{used}/{daily_limit}", text_color=used_color)
+                used = self._quota_tracker.get_used(email, uid)
+                held = self._quota_tracker.get_reserved(email, uid)
+                used_text = f"{used}/{daily_limit}" + (f"  (+{held} held)" if held else "")
+                used_color = "#ff5555" if used >= daily_limit else "#ffffff"
+                labels["used"].configure(text=used_text, text_color=used_color)
 
                 # Calculate resets_in
                 q_key = self._quota_tracker._key(email, uid)
@@ -557,12 +558,14 @@ class UbiTokeerApp(ctk.CTk):
                     # No +/- buttons for untracked
                     continue
 
-                remaining = self._quota_tracker.get_remaining(email, uid)
-                used = daily_limit - remaining
-
-                used_color = "#ff5555" if remaining == 0 else "#ffffff"
+                # Show REAL recorded usage (what +/- control), plus any live holds
+                # separately — so reservations never make the number look stuck.
+                used = self._quota_tracker.get_used(email, uid)
+                held = self._quota_tracker.get_reserved(email, uid)
+                used_text = f"{used}/{daily_limit}" + (f"  (+{held} held)" if held else "")
+                used_color = "#ff5555" if used >= daily_limit else "#ffffff"
                 lbl_used = ctk.CTkLabel(
-                    table, text=f"{used}/{daily_limit}", anchor="w",
+                    table, text=used_text, anchor="w",
                     text_color=used_color
                 )
                 lbl_used.grid(row=i, column=1, sticky="w", padx=6, pady=1)

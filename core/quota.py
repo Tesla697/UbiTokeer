@@ -106,6 +106,18 @@ class QuotaTracker:
     def can_generate(self, account_email: str, uplay_id: str) -> bool:
         return self.get_remaining(account_email, uplay_id) > 0
 
+    def get_used(self, account_email: str, uplay_id: str) -> int:
+        """Real recorded usage (window-aware), NOT counting live reservations.
+        This is what the admin Quota panel shows and what +/- move, so transient
+        holds can't make the number look stuck."""
+        with self._lock:
+            return self._used_locked(account_email, uplay_id)
+
+    def get_reserved(self, account_email: str, uplay_id: str) -> int:
+        """How many slots this account is currently holding as reservations."""
+        with self._lock:
+            return self._reserved_locked(account_email, uplay_id)
+
     def try_reserve(self, job_id: str, accounts: list[dict], uplay_id: str) -> str | None:
         """Atomically hold one slot for uplay_id against the first account with room.
 
