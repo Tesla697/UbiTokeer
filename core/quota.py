@@ -200,6 +200,26 @@ class QuotaTracker:
             )
             self._save()
 
+    def exhaust(self, account_email: str, uplay_id: str) -> None:
+        """Mark an account as fully used for this game NOW. Used when Ubisoft reports
+        the real activation limit is hit even though our internal count still showed
+        slots free — this removes that phantom availability so the account is not
+        handed to the next user (who would just fail the same way). Resets on the
+        normal 24h window like any other usage."""
+        with self._lock:
+            key = self._key(account_email, uplay_id)
+            entry = self._data.get(key)
+            now = time.time()
+            if not entry or now > entry["window_start"] + 86400:
+                self._data[key] = {"count": self._daily_limit, "window_start": now}
+            else:
+                entry["count"] = self._daily_limit
+            self._save()
+        logger.warning(
+            f"Quota EXHAUSTED (real Ubisoft limit hit): {account_email}:{uplay_id} "
+            f"forced to {self._daily_limit}/{self._daily_limit}"
+        )
+
     def get_simple(self, uplay_id: str, accounts: list[dict]) -> dict:
         game_names = load_game_names()
         total_remaining = 0

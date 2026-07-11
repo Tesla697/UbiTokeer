@@ -25,6 +25,18 @@ class BusyError(Exception):
     pass
 
 
+def _is_activation_limit(err) -> bool:
+    """True when a generation failure means the account's REAL Ubisoft activation
+    limit is hit (as opposed to a transient/network error)."""
+    s = str(err).lower()
+    return (
+        "exceed" in s
+        or "activation limit" in s
+        or "exceededactivations" in s
+        or "daily" in s and "limit" in s
+    )
+
+
 class JobQueue:
     def __init__(self, config: dict, on_update: Optional[Callable] = None):
         self._config = config
@@ -278,6 +290,11 @@ class JobQueue:
             except Exception as e:
                 last_error = e
                 logger.warning(f"Job {job.id}: Account {acc['email']} failed: {e}")
+                # If Ubisoft says this account's real activation limit is hit, our
+                # internal count was wrong (phantom token). Force it to exhausted so
+                # it isn't offered to the next user this window.
+                if _is_activation_limit(e) and acc.get("track_quota", True):
+                    self._quota.exhaust(acc["email"], job.uplay_id)
                 continue
 
         # All accounts failed
