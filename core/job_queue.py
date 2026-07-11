@@ -42,9 +42,10 @@ class JobQueue:
         self._worker = CliWorker(
             process_timeout=config.get("process_timeout", 90),
         )
-        # How long a RESERVED slot may sit before the sweeper reclaims it (the
-        # bot also cancels explicitly on close, this is the safety net for crashes).
-        self._reservation_ttl = config.get("reservation_ttl", 900)
+        # How long a RESERVED slot may sit before the sweeper reclaims it. Matches
+        # the bot's 30-min ticket lifetime so a user's slot stays held for the whole
+        # window they have to upload; the bot also cancels explicitly on close.
+        self._reservation_ttl = config.get("reservation_ttl", 1800)
         self._max_queue = config.get("max_queue", 50)
         self._last_sweep = 0.0
         self._running = True
