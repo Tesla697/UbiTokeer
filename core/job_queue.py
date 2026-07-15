@@ -318,6 +318,21 @@ class JobQueue:
         """Live reservation snapshot: {'total': N, 'by_uplay': {uplay_id: count}}."""
         return self._quota.reservations_snapshot()
 
+    def reconcile_reservations(self, active_job_ids, grace_seconds: float = 60.0) -> dict:
+        """Release holds with no matching open ticket (the bot supplies the live
+        job_ids). Orphaned RESERVED jobs are also marked FAILED so a late
+        activate can't resurrect a slot we just handed back to the pool."""
+        released = self._quota.reconcile(active_job_ids, grace_seconds)
+        if released:
+            with self._lock:
+                for jid in released:
+                    job = self._jobs.get(jid)
+                    if job and job.status == JobStatus.RESERVED:
+                        job.status = JobStatus.FAILED
+                        job.error = "reservation reconciled (ticket no longer open)"
+            self._notify_update()
+        return {"released": len(released), "job_ids": released}
+
     def _notify_update(self) -> None:
         if self._on_update:
             try:

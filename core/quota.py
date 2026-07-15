@@ -9,6 +9,7 @@ logger = logging.getLogger("ubitokeer")
 
 QUOTA_PATH = Path(__file__).parent.parent / "quota.json"
 GAME_NAMES_PATH = Path(__file__).parent.parent / "game_names.json"
+RESERVATIONS_PATH = Path(__file__).parent.parent / "reservations.json"
 
 
 def load_game_names() -> dict[str, str]:
@@ -90,12 +91,38 @@ class QuotaTracker:
             except Exception as e:
                 logger.warning(f"Failed to load quota.json: {e}")
                 self._data = {}
+        # Holds MUST survive a restart: without this every in-flight ticket
+        # silently loses the slot it is holding, so the pool looks free and the
+        # same slot can be handed to someone else. Any drift against reality is
+        # corrected by reconcile(), which treats the bot's ticket table as truth.
+        if RESERVATIONS_PATH.exists():
+            try:
+                loaded = json.loads(RESERVATIONS_PATH.read_text()) or {}
+                if isinstance(loaded, dict):
+                    self._reservations = {
+                        jid: r for jid, r in loaded.items()
+                        if isinstance(r, dict) and r.get("uplay_id") and r.get("account_email")
+                    }
+                    logger.info(
+                        f"Reservations restored: {len(self._reservations)} held slot(s)"
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to load reservations.json: {e}")
+                self._reservations = {}
 
     def _save(self) -> None:
         try:
             QUOTA_PATH.write_text(json.dumps(self._data, indent=2))
         except Exception as e:
             logger.error(f"Failed to save quota.json: {e}")
+
+    def _save_reservations(self) -> None:
+        """Persist live holds. Callers already hold self._lock, so this must not
+        take it again."""
+        try:
+            RESERVATIONS_PATH.write_text(json.dumps(self._reservations, indent=2))
+        except Exception as e:
+            logger.error(f"Failed to save reservations.json: {e}")
 
     def get_remaining(self, account_email: str, uplay_id: str) -> int:
         with self._lock:
@@ -135,6 +162,7 @@ class QuotaTracker:
                     self._reservations[job_id] = {
                         "account_email": email, "uplay_id": uplay_id, "created_at": time.time(),
                     }
+                    self._save_reservations()
                     return email
                 used = self._used_locked(email, uplay_id)
                 reserved = self._reserved_locked(email, uplay_id)
@@ -142,6 +170,7 @@ class QuotaTracker:
                     self._reservations[job_id] = {
                         "account_email": email, "uplay_id": uplay_id, "created_at": time.time(),
                     }
+                    self._save_reservations()
                     logger.info(
                         f"Quota reserved: {email}:{uplay_id} (job {job_id}) — "
                         f"{used} used, {reserved + 1} held, "
@@ -155,6 +184,8 @@ class QuotaTracker:
         cancel, or sweep. Safe to call for a job that never reserved."""
         with self._lock:
             r = self._reservations.pop(job_id, None)
+            if r:
+                self._save_reservations()
         if r:
             logger.info(f"Quota reservation released: job {job_id} ({r['account_email']}:{r['uplay_id']})")
         return r is not None
@@ -170,9 +201,44 @@ class QuotaTracker:
             ]
             for jid in stale:
                 del self._reservations[jid]
+            if stale:
+                self._save_reservations()
         if stale:
             logger.info(f"Swept {len(stale)} stale reservation(s): {stale}")
         return stale
+
+    def reconcile(self, active_job_ids, grace_seconds: float = 60.0) -> list[str]:
+        """Release holds that no longer belong to a live ticket.
+
+        The bot's ticket table — not this cache — is the source of truth for what
+        is actually open, so it periodically sends the job_ids of its open
+        tickets and we drop everything else. This is what reclaims a hold leaked
+        by a manually-deleted thread, a cancel that never landed, or a ticket
+        closed while the backend was unreachable, instead of stalling stock until
+        the TTL sweep.
+
+        Holds younger than grace_seconds are always kept: a slot reserved during
+        ticket-open hasn't had its job_id written to the bot's table yet, so
+        without the grace window a reconcile could release a slot out from under
+        a ticket that is still opening. Returns the released job_ids.
+        """
+        keep = {str(j) for j in (active_job_ids or []) if j}
+        now = time.time()
+        with self._lock:
+            orphaned = [
+                jid for jid, r in self._reservations.items()
+                if jid not in keep and (now - r.get("created_at", 0)) > grace_seconds
+            ]
+            for jid in orphaned:
+                del self._reservations[jid]
+            if orphaned:
+                self._save_reservations()
+        if orphaned:
+            logger.info(
+                f"Reconcile released {len(orphaned)} orphaned reservation(s) "
+                f"(no open ticket): {orphaned}"
+            )
+        return orphaned
 
     def decrement(self, account_email: str, uplay_id: str) -> None:
         with self._lock:

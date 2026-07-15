@@ -129,3 +129,23 @@ def get_status():
 def get_reservations():
     """Just the live reservation snapshot: {total, by_uplay}."""
     return _queue.get_reservations()
+
+
+class ReconcileRequest(BaseModel):
+    # job_ids of every ticket the bot still has open. Anything held here that
+    # isn't in this list has no ticket behind it and gets released.
+    active_job_ids: list[str] = []
+    grace_seconds: float = 60.0
+
+
+@app.post("/reservations/reconcile")
+def reconcile_reservations(body: ReconcileRequest):
+    """Drop held slots that no longer map to an open ticket.
+
+    The bot's ticket table is the source of truth; it posts the job_ids of its
+    live tickets every couple of minutes and we release the rest. This reclaims
+    holds leaked by a deleted thread or a cancel that never landed, so the held
+    count reflects the tickets that are actually open.
+    """
+    result = _queue.reconcile_reservations(body.active_job_ids, body.grace_seconds)
+    return {"ok": True, **result}
