@@ -35,6 +35,9 @@ def load_config() -> dict:
         "daily_limit": 5,
         "process_timeout": 90,
         "output_formats": {},
+        # Shared secret the bot sends as X-API-Key. Leave blank ONLY if this port
+        # is unreachable from the internet — every endpoint is open without it.
+        "api_key": "",
     }
 
 
@@ -88,6 +91,14 @@ class ServerManager:
         if self._server_thread and self._server_thread.is_alive():
             logger.warning("Server is already running")
             return
+
+        # Apply auth + make sure the public care-package folder exists before the
+        # port opens, so we never serve a window of unauthenticated endpoints.
+        server_api.set_api_key(self._config.get("api_key", ""))
+        try:
+            server_api.CAREPACKAGES_DIR.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            logger.warning(f"Could not create carepackages dir: {e}")
 
         port = self._config.get("port", 8090)
         uv_config = uvicorn.Config(

@@ -1,8 +1,10 @@
 import logging
+import secrets
+from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 from core.job_queue import BusyError, JobQueue
@@ -13,11 +15,74 @@ logger = logging.getLogger("ubitokeer")
 app = FastAPI(title="UbiTokeer", docs_url=None, redoc_url=None)
 
 _queue: Optional[JobQueue] = None
+_api_key: str = ""
+
+# Care packages are downloaded straight from a Discord ticket by ordinary users,
+# so this prefix is the ONE route that must stay unauthenticated.
+PUBLIC_PATH_PREFIXES = ("/carepackage/",)
+CAREPACKAGES_DIR = Path(__file__).parent.parent / "carepackages"
 
 
 def set_queue(queue: JobQueue) -> None:
     global _queue
     _queue = queue
+
+
+def set_api_key(key: str) -> None:
+    global _api_key
+    _api_key = (key or "").strip()
+    if _api_key:
+        logger.info("API key auth ENABLED — requests must send X-API-Key")
+    else:
+        logger.warning(
+            "API key auth DISABLED (no api_key in config.json) — every endpoint on "
+            "this port is open to anyone who can reach it. Set api_key to the same "
+            "value the bot uses."
+        )
+
+
+@app.middleware("http")
+async def require_api_key(request: Request, call_next):
+    """Gate every endpoint except the public care-package downloads.
+
+    This server binds 0.0.0.0 and, once a care-package link puts its address in
+    front of users, anyone could otherwise POST /request to drain the token pool,
+    read account emails from /accounts/health, or cancel other people's jobs. The
+    bot already sends X-API-Key on its calls, so this is a drop-in lock.
+    """
+    if _api_key and not request.url.path.startswith(PUBLIC_PATH_PREFIXES):
+        supplied = request.headers.get("X-API-Key", "")
+        # Constant-time compare so the key can't be recovered by timing.
+        if not secrets.compare_digest(supplied, _api_key):
+            logger.warning(
+                f"Rejected unauthenticated {request.method} {request.url.path} "
+                f"from {request.client.host if request.client else 'unknown'}"
+            )
+            return JSONResponse(status_code=401, content={"error": "unauthorized"})
+    return await call_next(request)
+
+
+@app.get("/carepackage/{filename}")
+def get_carepackage(filename: str):
+    """Public care-package download (the only unauthenticated route).
+
+    Users click this straight out of a Discord ticket, so it must serve without a
+    key — which also means it must never be talked into serving anything except a
+    zip that we deliberately placed in carepackages/.
+    """
+    # No traversal, no nested paths, zips only.
+    if "/" in filename or "\\" in filename or ".." in filename:
+        raise HTTPException(status_code=400, detail="bad filename")
+    if not filename.lower().endswith(".zip"):
+        raise HTTPException(status_code=404, detail="not found")
+    base = CAREPACKAGES_DIR.resolve()
+    path = (base / filename).resolve()
+    # Belt-and-braces: the resolved path must still sit inside carepackages/.
+    if base not in path.parents:
+        raise HTTPException(status_code=400, detail="bad filename")
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="not found")
+    return FileResponse(path, media_type="application/zip", filename=filename)
 
 
 class JobRequest(BaseModel):
