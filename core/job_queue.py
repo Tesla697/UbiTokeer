@@ -42,7 +42,11 @@ class JobQueue:
     def __init__(self, config: dict, on_update: Optional[Callable] = None):
         self._config = config
         self._on_update = on_update
-        self._lock = threading.Lock()
+        # RLock, not Lock: several helpers below are reachable both directly and
+        # from code that already holds this lock, and a plain Lock re-acquired by
+        # the same thread deadlocks it permanently — taking the whole queue
+        # (reserve/activate/cancel) down with it until the process is restarted.
+        self._lock = threading.RLock()
         self._current: Optional[Job] = None
         # FIFO of jobs waiting for the worker. A deque (instead of a single slot)
         # so an activated reservation is never bounced with "queue full" just
@@ -209,16 +213,29 @@ class JobQueue:
 
     def _worker_loop(self) -> None:
         while self._running:
+            job = None
             with self._condition:
                 while not self._pending and self._running:
                     self._condition.wait(timeout=1.0)
-                    self._maybe_sweep()
+                    # NOTE: the sweep runs OUTSIDE this block (below). It used to be
+                    # called here, while holding the condition's lock, and then took
+                    # that same lock again to fail expired jobs — which deadlocked the
+                    # worker against itself the first time a reservation went stale,
+                    # and with it every reserve/activate/cancel.
+                    if self._sweep_due():
+                        break
 
                 if not self._running:
                     break
 
-                job = self._pending.popleft()
-                self._current = job
+                if self._pending:
+                    job = self._pending.popleft()
+                    self._current = job
+
+            if job is None:
+                # Woke up to sweep, not to work: do it with NO lock held.
+                self._maybe_sweep()
+                continue
 
             self._notify_update()
             self._process_job(job)
@@ -228,8 +245,14 @@ class JobQueue:
 
             self._notify_update()
 
+    def _sweep_due(self) -> bool:
+        """True when the throttled sweep window has elapsed. Cheap + lock-free so it
+        can be checked from inside the condition wait."""
+        return (time.time() - self._last_sweep) >= 30
+
     def _maybe_sweep(self) -> None:
-        """Throttled reservation sweep (~every 30s) run from the worker's idle wait."""
+        """Throttled reservation sweep (~every 30s). MUST be called with no lock
+        held — it acquires self._lock to fail expired jobs."""
         now = time.time()
         if now - self._last_sweep < 30:
             return
