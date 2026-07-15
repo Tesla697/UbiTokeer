@@ -3,6 +3,9 @@ UbiTokeer Backend
 Entry point — starts the FastAPI server and CustomTkinter GUI.
 """
 
+import ctypes
+ctypes.windll.kernel32.SetConsoleTitleW("UbiTokeer backend")
+
 import json
 import logging
 import sys

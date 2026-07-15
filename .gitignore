@@ -1,5 +1,16 @@
-# Activator binaries and DLLs
+# Activator binaries and DLLs. NOTE: the real folder on the server is
+# `activator_cli/` — `activator/` alone never matched it, so GitHub Desktop kept
+# stashing (and offering to commit) every account's DenuvoTicket.exe.
 activator/
+activator_cli/
+
+# Care packages served over /carepackage — big binaries, not source.
+carepackages/
+
+# Runtime state written by the backend (holds + login health). Machine-specific,
+# and login_health.json contains account emails.
+reservations.json
+login_health.json
 
 # Generated tokens
 *.ini
@@ -10,6 +21,7 @@ quota.json
 
 # Credentials
 accounts.json
+accounts.json.txt
 config.json
 LoginStore.dat
 
