@@ -8,6 +8,7 @@ from typing import Callable, Optional
 from core.accounts import get_account_for_uplay_id, get_accounts_for_uplay_id, has_any_account_for_uplay_id
 from core.cli_worker import CliWorker
 from core.job import Job, JobStatus
+from core.login_keepalive import LoginKeepAlive
 from core.quota import QuotaExceededError, QuotaTracker
 
 logger = logging.getLogger("ubitokeer")
@@ -63,6 +64,19 @@ class JobQueue:
         self._running = True
         self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
         self._worker_thread.start()
+        # Keeps idle accounts' LoginStore.dat sessions alive (and flags dead ones
+        # early) so an account nobody used for days doesn't fail a real ticket.
+        # Only runs while the queue is idle, and never spends quota.
+        self._keepalive = LoginKeepAlive(
+            worker=self._worker,
+            is_busy=lambda: bool(self._current or self._pending),
+            interval_seconds=config.get("login_refresh_interval_seconds", 3600),
+            stale_seconds=config.get("login_refresh_stale_seconds", 3 * 86400),
+            enabled=config.get("login_refresh_enabled", True),
+            fail_backoff_seconds=config.get("login_refresh_fail_backoff_seconds", 3600),
+            fail_backoff_max_seconds=config.get("login_refresh_fail_backoff_max_seconds", 86400),
+        )
+        self._keepalive.start()
         logger.info("Job queue started")
 
     # ------------------------------------------------------------------
@@ -283,6 +297,9 @@ class JobQueue:
                 # The reservation has now become a real recorded use — drop the hold
                 # so we don't double-count the slot.
                 self._quota.release(job.id)
+                # A real generation just proved this login works — no need for the
+                # keep-alive to re-launch a CLI for it.
+                self._keepalive.note_used(acc["email"])
                 logger.info(f"Job {job.id} completed successfully (account {acc['email']}, format={output_format})")
                 self._notify_update()
                 return
@@ -290,6 +307,11 @@ class JobQueue:
             except Exception as e:
                 last_error = e
                 logger.warning(f"Job {job.id}: Account {acc['email']} failed: {e}")
+                # A dead stored session shows up here first — flag it immediately so
+                # the health view says "needs re-login" instead of us finding out
+                # from the next user whose ticket dies.
+                if "authentication failed" in str(e).lower():
+                    self._keepalive.note_auth_failed(acc["email"])
                 # If Ubisoft says this account's real activation limit is hit, our
                 # internal count was wrong (phantom token). Force it to exhausted so
                 # it isn't offered to the next user this window.
@@ -318,6 +340,14 @@ class JobQueue:
         """Live reservation snapshot: {'total': N, 'by_uplay': {uplay_id: count}}."""
         return self._quota.reservations_snapshot()
 
+    def get_login_health(self) -> dict:
+        """Per-account LoginStore.dat session health (which need a manual re-login)."""
+        return self._keepalive.get_health()
+
+    def refresh_logins(self, force: bool = False) -> dict:
+        """Refresh stale account sessions now (force=True does every account)."""
+        return self._keepalive.refresh_all(force=force)
+
     def reconcile_reservations(self, active_job_ids, grace_seconds: float = 60.0) -> dict:
         """Release holds with no matching open ticket (the bot supplies the live
         job_ids). Orphaned RESERVED jobs are also marked FAILED so a late
@@ -345,6 +375,10 @@ class JobQueue:
 
     def shutdown(self) -> None:
         self._running = False
+        try:
+            self._keepalive.stop()
+        except Exception:
+            pass
         with self._condition:
             self._condition.notify_all()
         logger.info("Job queue shut down")

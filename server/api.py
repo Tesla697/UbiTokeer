@@ -131,6 +131,32 @@ def get_reservations():
     return _queue.get_reservations()
 
 
+@app.get("/accounts/health")
+def get_login_health():
+    """Per-account LoginStore.dat session health.
+
+    `needs_login: true` means that account's stored session is dead and someone
+    has to sign it in again — surfaced here BEFORE a user's ticket fails on it.
+    """
+    return _queue.get_login_health()
+
+
+class RefreshLoginsRequest(BaseModel):
+    # force=True re-authenticates every account, not just the stale ones.
+    force: bool = False
+
+
+@app.post("/accounts/refresh")
+def refresh_logins(body: RefreshLoginsRequest | None = None):
+    """Re-authenticate stored sessions now, so idle accounts don't go dead.
+
+    Costs nothing: the CLI stops at the appId prompt and never sends a ticket
+    request, so no token is minted and no quota is spent.
+    """
+    force = bool(body.force) if body else False
+    return {"ok": True, **_queue.refresh_logins(force=force)}
+
+
 class ReconcileRequest(BaseModel):
     # job_ids of every ticket the bot still has open. Anything held here that
     # isn't in this list has no ticket behind it and gets released.

@@ -163,6 +163,85 @@ class CliWorker:
         result["console_output"] = full_output
         return result
 
+    def refresh_login(self, folder: str, accid: str, timeout: int = 90) -> dict:
+        """Re-authenticate an account WITHOUT generating anything, so a session that
+        nobody has used for days is exercised and re-saved before it goes stale.
+
+        The CLI authenticates at launch: the appId prompt only appears once the
+        stored LoginStore.dat session was accepted. So reaching that prompt proves
+        the login still works — and we quit right there, never sending a denuvo
+        ticket request. That means NO token is minted, NO activation is burned and
+        NO quota is spent; the only side effect is the refreshed session on disk.
+
+        Returns {"ok": bool, "reason": str}.
+        """
+        folder_path = Path(folder).resolve()
+        exe_path = folder_path / "DenuvoTicket.exe"
+        command_txt = folder_path / "command.txt"
+
+        if not exe_path.exists():
+            return {"ok": False, "reason": f"DenuvoTicket.exe not found at {exe_path}"}
+
+        if command_txt.exists():
+            cmd = command_txt.read_text().strip()
+            cmd = cmd.replace("DenuvoTicket.exe", str(exe_path), 1)
+        else:
+            cmd = f"{exe_path} -remember-me -remember-device -accid {accid} -usefilestore"
+
+        logger.info(f"Login keep-alive: refreshing session (accid={accid[:8]}..., folder={folder_path.name})")
+
+        collected_output = []
+        pty = None
+        stop_event = threading.Event()
+        reader_thread = None
+        try:
+            pty = winpty.PtyProcess.spawn(cmd, cwd=str(folder_path), dimensions=(25, 5000))
+
+            def _reader():
+                while not stop_event.is_set():
+                    try:
+                        data = pty.read(4096)
+                        if data:
+                            collected_output.append(data)
+                    except EOFError:
+                        break
+                    except Exception:
+                        break
+
+            reader_thread = threading.Thread(target=_reader, daemon=True)
+            reader_thread.start()
+
+            deadline = time.time() + timeout
+            reached_prompt = False
+            while time.time() < deadline:
+                full = "".join(collected_output)
+                if "authentication failed" in full.lower():
+                    return {"ok": False, "reason": "Authentication failed — needs manual re-login"}
+                if "appid" in full.lower():
+                    reached_prompt = True
+                    break
+                if not pty.isalive():
+                    break
+                time.sleep(0.5)
+
+            full = "".join(collected_output)
+            if reached_prompt:
+                # Give CoreLib a beat to flush the refreshed session to LoginStore.dat
+                # before we tear the process down.
+                time.sleep(2)
+                return {"ok": True, "reason": "session refreshed"}
+            if "authentication failed" in full.lower():
+                return {"ok": False, "reason": "Authentication failed — needs manual re-login"}
+            return {"ok": False, "reason": "Timed out waiting for the appId prompt (login likely stale)"}
+        except Exception as e:
+            return {"ok": False, "reason": f"Failed to launch CLI: {e}"}
+        finally:
+            stop_event.set()
+            self._stop_pty(pty)
+            if reader_thread and reader_thread.is_alive():
+                reader_thread.join(timeout=2)
+            self._kill_leftover_processes(exe_path)
+
     def _stop_pty(self, pty) -> None:
         if not pty:
             return
