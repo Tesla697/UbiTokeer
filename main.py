@@ -15,6 +15,7 @@ from pathlib import Path
 import uvicorn
 
 from core.job_queue import JobQueue, load_output_formats
+from core.node_registry import NodeRegistry
 from gui.app import UbiTokeerApp
 from server import api as server_api
 
@@ -41,6 +42,10 @@ def load_config() -> dict:
         # Shared secret the bot sends as X-API-Key. Leave blank ONLY if this port
         # is unreachable from the internet — every endpoint is open without it.
         "api_key": "",
+        # Remote donor nodes: {node_id: {"key": "<secret>"}}. Each donor runs the
+        # node client with their own node_id + key; the matching account lives in
+        # accounts.json with "remote": true, "node_id": "<node_id>".
+        "nodes": {},
     }
 
 
@@ -147,10 +152,17 @@ def main() -> None:
     # Load output format overrides (e.g. {"4740": "dbdata"})
     load_output_formats(config.get("output_formats", {}))
 
+    # Registry of remote donor nodes (games served from a donor's own PC).
+    node_registry = NodeRegistry(
+        nodes=config.get("nodes", {}),
+        online_ttl=config.get("node_online_ttl", 45),
+    )
+
     # Job queue
     job_queue = JobQueue(
         config=config,
         on_update=lambda: app.after(0, lambda: app.update_queue_state(job_queue.get_state())),
+        nodes=node_registry,
     )
 
     # Give GUI access to quota tracker
@@ -159,6 +171,7 @@ def main() -> None:
     # Server manager
     server_mgr = ServerManager(config)
     server_api.set_queue(job_queue)
+    server_api.set_node_registry(node_registry)
 
     # Auto-start server
     server_mgr.start()

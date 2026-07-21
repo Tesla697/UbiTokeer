@@ -1,0 +1,16 @@
+{
+  "backend_url": "https://api.luastools.xyz",
+  "node_id": "pragmata-donor",
+  "key": "PASTE-THE-SECRET-WE-GIVE-YOU",
+
+  "folder": "C:\\Path\\To\\Your\\DenuvoTicket\\Folder",
+  "accid": "",
+  "uplay_ids": ["3357650"],
+
+  "poll_wait": 25,
+  "process_timeout": 120,
+
+  "login_refresh_enabled": true,
+  "login_refresh_interval_seconds": 3600,
+  "login_refresh_timeout": 90
+}

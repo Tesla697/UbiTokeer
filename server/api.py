@@ -8,6 +8,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 from core.job_queue import BusyError, JobQueue
+from core.node_registry import NodeRegistry
 from core.quota import QuotaExceededError
 
 logger = logging.getLogger("ubitokeer")
@@ -15,17 +16,27 @@ logger = logging.getLogger("ubitokeer")
 app = FastAPI(title="UbiTokeer", docs_url=None, redoc_url=None)
 
 _queue: Optional[JobQueue] = None
+_nodes: Optional[NodeRegistry] = None
 _api_key: str = ""
 
 # Care packages are downloaded straight from a Discord ticket by ordinary users,
 # so this prefix is the ONE route that must stay unauthenticated.
 PUBLIC_PATH_PREFIXES = ("/carepackage/",)
+# Donor-node routes carry their OWN per-node key (validated inside each handler),
+# NOT the master api_key — so a donor can serve jobs without a key that could
+# drain the pool. They're exempt from the master-key middleware for that reason.
+NODE_PATH_PREFIX = "/node/"
 CAREPACKAGES_DIR = Path(__file__).parent.parent / "carepackages"
 
 
 def set_queue(queue: JobQueue) -> None:
     global _queue
     _queue = queue
+
+
+def set_node_registry(nodes: NodeRegistry) -> None:
+    global _nodes
+    _nodes = nodes
 
 
 def set_api_key(key: str) -> None:
@@ -50,7 +61,9 @@ async def require_api_key(request: Request, call_next):
     read account emails from /accounts/health, or cancel other people's jobs. The
     bot already sends X-API-Key on its calls, so this is a drop-in lock.
     """
-    if _api_key and not request.url.path.startswith(PUBLIC_PATH_PREFIXES):
+    if (_api_key
+            and not request.url.path.startswith(PUBLIC_PATH_PREFIXES)
+            and not request.url.path.startswith(NODE_PATH_PREFIX)):
         supplied = request.headers.get("X-API-Key", "")
         # Constant-time compare so the key can't be recovered by timing.
         if not secrets.compare_digest(supplied, _api_key):
@@ -187,6 +200,8 @@ def get_status():
         # Slots held by open tickets that haven't uploaded a token_req yet.
         "reservations_total": reservations["total"],
         "reservations_by_uplay": reservations["by_uplay"],
+        # Donor nodes currently connected (their games are in-stock).
+        "nodes_online": _nodes.online_nodes() if _nodes else [],
     }
 
 
@@ -240,3 +255,68 @@ def reconcile_reservations(body: ReconcileRequest):
     """
     result = _queue.reconcile_reservations(body.active_job_ids, body.grace_seconds)
     return {"ok": True, **result}
+
+
+# ---------------------------------------------------------------------------
+# Donor nodes (remote workers running on a donor's PC)
+# ---------------------------------------------------------------------------
+class NodePoll(BaseModel):
+    node_id: str
+    key: str
+    # How long the server may hold this request open waiting for work (long-poll).
+    wait: float = 25.0
+
+
+class NodeResult(BaseModel):
+    node_id: str
+    key: str
+    job_id: str
+    # On success, the same fields CliWorker.generate() produces on the backend.
+    denuvo_token: Optional[str] = None
+    ownership_token: Optional[str] = None
+    dlc_ids: Optional[list[int]] = None
+    console_output: str = ""
+    # On failure, a human-readable reason instead of the tokens.
+    error: Optional[str] = None
+
+
+@app.post("/node/poll")
+def node_poll(body: NodePoll):
+    """Long-poll for the next job assigned to a donor node.
+
+    Authenticated by the node's own key (not the master api_key). Each poll also
+    marks the node online, so a node that keeps polling keeps its game in-stock.
+    Returns a job to generate, or 204 when the wait elapses with nothing to do."""
+    if _nodes is None:
+        raise HTTPException(status_code=503, detail="donor nodes not enabled")
+    try:
+        job = _nodes.poll(body.node_id, body.key, wait=body.wait)
+    except PermissionError:
+        return JSONResponse(status_code=401, content={"error": "unauthorized"})
+    if job is None:
+        return JSONResponse(status_code=204, content=None)
+    return job
+
+
+@app.post("/node/result")
+def node_result(body: NodeResult):
+    """Deliver a donor node's generation result (or error) back to its job."""
+    if _nodes is None:
+        raise HTTPException(status_code=503, detail="donor nodes not enabled")
+    result = None
+    if body.error is None:
+        result = {
+            "denuvo_token": body.denuvo_token,
+            "ownership_token": body.ownership_token,
+            "dlc_ids": body.dlc_ids,
+            "console_output": body.console_output,
+        }
+    try:
+        accepted = _nodes.submit_result(
+            body.node_id, body.key, body.job_id, result=result, error=body.error
+        )
+    except PermissionError:
+        return JSONResponse(status_code=401, content={"error": "unauthorized"})
+    # accepted=False means the job already timed out server-side — tell the node so
+    # it stops waiting on a dead job.
+    return {"ok": accepted}

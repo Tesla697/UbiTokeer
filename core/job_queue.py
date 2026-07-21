@@ -5,10 +5,11 @@ from collections import deque
 from datetime import datetime
 from typing import Callable, Optional
 
-from core.accounts import get_account_for_uplay_id, get_accounts_for_uplay_id, has_any_account_for_uplay_id
+from core.accounts import get_accounts_for_uplay_id, has_any_account_for_uplay_id
 from core.cli_worker import CliWorker
 from core.job import Job, JobStatus
 from core.login_keepalive import LoginKeepAlive
+from core.node_registry import NodeRegistry
 from core.quota import QuotaExceededError, QuotaTracker
 
 logger = logging.getLogger("ubitokeer")
@@ -39,9 +40,16 @@ def _is_activation_limit(err) -> bool:
 
 
 class JobQueue:
-    def __init__(self, config: dict, on_update: Optional[Callable] = None):
+    def __init__(self, config: dict, on_update: Optional[Callable] = None,
+                 nodes: Optional[NodeRegistry] = None):
         self._config = config
         self._on_update = on_update
+        # Registry of remote donor nodes (games served from someone else's PC).
+        # None = no donor support; every game is served by local accounts.
+        self._nodes = nodes
+        # How long to wait for a donor node to return a generated token before the
+        # job is failed. Covers the node's own process time plus network latency.
+        self._node_job_timeout = config.get("node_job_timeout", 180)
         # RLock, not Lock: several helpers below are reachable both directly and
         # from code that already holds this lock, and a plain Lock re-acquired by
         # the same thread deadlocks it permanently — taking the whole queue
@@ -84,6 +92,22 @@ class JobQueue:
         logger.info("Job queue started")
 
     # ------------------------------------------------------------------
+    # Account availability (local accounts are always available; a remote
+    # donor account is only available while its node is connected)
+    # ------------------------------------------------------------------
+    def _account_available(self, acc: dict) -> bool:
+        if acc.get("remote"):
+            return bool(self._nodes and self._nodes.is_online(acc.get("node_id", "")))
+        return True
+
+    def _available_accounts(self, uplay_id: str) -> list[dict]:
+        """Accounts assigned to uplay_id that can actually serve right now — i.e.
+        with any offline donor nodes filtered out. An empty list means the game is
+        out of stock (donor offline), so reserve/submit refuse it and the bot sees
+        remaining=0."""
+        return [a for a in get_accounts_for_uplay_id(uplay_id) if self._account_available(a)]
+
+    # ------------------------------------------------------------------
     # Reservation lifecycle (the admission gate)
     # ------------------------------------------------------------------
     def reserve(self, uplay_id: str) -> Job:
@@ -95,7 +119,10 @@ class JobQueue:
         if not has_any_account_for_uplay_id(uplay_id):
             raise ValueError(f"No account assigned to uplay_id={uplay_id}")
 
-        accounts = get_accounts_for_uplay_id(uplay_id)
+        # Offline donor nodes are filtered out here, so a donor-only game whose node
+        # is disconnected has no available account → QuotaExceededError → the bot
+        # refuses the ticket (out of stock) rather than opening one it can't fulfil.
+        accounts = self._available_accounts(uplay_id)
         job = Job(uplay_id=uplay_id, account_email="", accid="", folder="", token_req="")
         job.status = JobStatus.RESERVED
 
@@ -112,6 +139,7 @@ class JobQueue:
         job.account_email = acc["email"]
         job.accid = acc["accid"]
         job.folder = acc["folder"]
+        job.node_id = acc.get("node_id") if acc.get("remote") else None
 
         with self._lock:
             self._jobs[job.id] = job
@@ -173,8 +201,13 @@ class JobQueue:
             raise ValueError(f"No account assigned to uplay_id={uplay_id}")
 
         # Account selection is reservation-aware (get_remaining subtracts held
-        # slots), so a direct submit won't grab a slot another ticket is holding.
-        account = get_account_for_uplay_id(uplay_id, self._quota)
+        # slots) AND availability-aware (offline donor nodes are skipped), so a
+        # direct submit won't grab a held slot or route to a disconnected donor.
+        account = next(
+            (a for a in self._available_accounts(uplay_id)
+             if not a.get("track_quota", True) or self._quota.can_generate(a["email"], uplay_id)),
+            None,
+        )
         if not account:
             raise QuotaExceededError(
                 f"Daily token limit reached for all accounts assigned to uplay_id={uplay_id}"
@@ -191,6 +224,7 @@ class JobQueue:
                 folder=account["folder"],
                 token_req=token_req,
             )
+            job.node_id = account.get("node_id") if account.get("remote") else None
             self._jobs[job.id] = job
             self._pending.append(job)
             self._condition.notify_all()
@@ -269,37 +303,67 @@ class JobQueue:
         except Exception as e:
             logger.error(f"Reservation sweep failed: {e}")
 
+    def _generate_on(self, acc: dict, job: Job) -> dict:
+        """Run one generation attempt for `job` on `acc`. A remote (donor) account
+        dispatches to its node; a local account runs the CLI here. Both return the
+        same {denuvo_token, ownership_token, dlc_ids, console_output} shape."""
+        if acc.get("remote"):
+            return self._nodes.dispatch_and_wait(
+                acc["node_id"], job.id, job.uplay_id, job.token_req, self._node_job_timeout
+            )
+        return self._worker.generate(
+            folder=acc["folder"], accid=acc["accid"],
+            uplay_id=job.uplay_id, token_req=job.token_req,
+        )
+
     def _process_job(self, job: Job) -> None:
         logger.info(f"Processing job {job.id}: uplay_id={job.uplay_id}, account={job.account_email}")
         job.status = JobStatus.PROCESSING
         self._notify_update()
 
-        # Build list of accounts to try: primary first, then fallbacks
-        all_accounts = get_accounts_for_uplay_id(job.uplay_id)
-        accounts_to_try = [{"email": job.account_email, "accid": job.accid, "folder": job.folder}]
-        for acc in all_accounts:
-            if acc["email"] != job.account_email and (not acc.get("track_quota", True) or self._quota.can_generate(acc["email"], job.uplay_id)):
-                accounts_to_try.append(acc)
+        # One unified fallback loop over ALL available accounts for this game —
+        # local accounts and remote donor nodes mixed together. The account reserved
+        # for this job is tried first, then the rest as fallbacks, so "one account
+        # runs out / fails → shift to the next" works identically whether the next
+        # account is on our backend or a donor's PC. Offline donor nodes are already
+        # filtered out (an offline node is never a fallback target).
+        available = self._available_accounts(job.uplay_id)
+        primary = next((a for a in available if a["email"] == job.account_email), None)
+        ordered = ([primary] if primary else []) + \
+                  [a for a in available if a["email"] != job.account_email]
+
+        if not ordered:
+            job.status = JobStatus.FAILED
+            job.error = "no account available (donor offline?)"
+            job.finished_at = datetime.utcnow()
+            self._quota.release(job.id)
+            logger.error(f"Job {job.id}: no available account for uplay_id={job.uplay_id}")
+            self._notify_update()
+            return
 
         last_error = None
-        for attempt, acc in enumerate(accounts_to_try):
+        for attempt, acc in enumerate(ordered):
+            # Skip a tracked fallback with no quota left. The reserved primary is
+            # always tried; untracked/donor accounts are unlimited so never skipped.
+            if attempt > 0 and acc.get("track_quota", True) \
+                    and not self._quota.can_generate(acc["email"], job.uplay_id):
+                continue
+
+            is_remote = bool(acc.get("remote"))
+            job.account_email = acc["email"]
+            job.accid = acc.get("accid", "")
+            job.folder = acc.get("folder", "")
+            job.node_id = acc.get("node_id") if is_remote else None
             if attempt > 0:
-                logger.info(f"Job {job.id}: Retrying with fallback account {acc['email']}...")
-                job.account_email = acc["email"]
-                job.accid = acc["accid"]
-                job.folder = acc["folder"]
+                logger.info(f"Job {job.id}: falling back to "
+                            f"{'donor ' if is_remote else ''}account {acc['email']}...")
 
             try:
-                result = self._worker.generate(
-                    folder=acc["folder"],
-                    accid=acc["accid"],
-                    uplay_id=job.uplay_id,
-                    token_req=job.token_req,
-                )
+                result = self._generate_on(acc, job)
 
                 job.denuvo_token = result["denuvo_token"]
                 job.ownership_token = result["ownership_token"]
-                job.dlc_ids = result["dlc_ids"]
+                job.dlc_ids = result.get("dlc_ids")
                 job.console_output = result.get("console_output", "")
 
                 # Build formatted output based on game's output format
@@ -320,20 +384,26 @@ class JobQueue:
                 # The reservation has now become a real recorded use — drop the hold
                 # so we don't double-count the slot.
                 self._quota.release(job.id)
-                # A real generation just proved this login works — no need for the
-                # keep-alive to re-launch a CLI for it.
-                self._keepalive.note_used(acc["email"])
-                logger.info(f"Job {job.id} completed successfully (account {acc['email']}, format={output_format})")
+                # A real local generation just proved this login works — no need for
+                # the keep-alive to re-launch a CLI for it. (Donor nodes manage their
+                # own login, so there's nothing to note here.)
+                if not is_remote:
+                    self._keepalive.note_used(acc["email"])
+                logger.info(f"Job {job.id} completed successfully via "
+                            f"{'donor node ' + acc['node_id'] if is_remote else 'account ' + acc['email']} "
+                            f"(format={output_format})")
                 self._notify_update()
                 return
 
             except Exception as e:
                 last_error = e
-                logger.warning(f"Job {job.id}: Account {acc['email']} failed: {e}")
+                logger.warning(f"Job {job.id}: {'donor ' if is_remote else ''}"
+                               f"account {acc['email']} failed: {e}")
                 # A dead stored session shows up here first — flag it immediately so
                 # the health view says "needs re-login" instead of us finding out
-                # from the next user whose ticket dies.
-                if "authentication failed" in str(e).lower():
+                # from the next user whose ticket dies. (Local accounts only — the
+                # donor's session lives on their PC.)
+                if not is_remote and "authentication failed" in str(e).lower():
                     self._keepalive.note_auth_failed(acc["email"])
                 # If Ubisoft says this account's real activation limit is hit, our
                 # internal count was wrong (phantom token). Force it to exhausted so
@@ -352,7 +422,9 @@ class JobQueue:
         self._notify_update()
 
     def get_quota_simple(self, uplay_id: str) -> dict:
-        accounts = get_accounts_for_uplay_id(uplay_id)
+        # Only count accounts that can serve right now, so a game whose donor node
+        # is offline correctly reports remaining=0 (out of stock) to the bot.
+        accounts = self._available_accounts(uplay_id)
         return self._quota.get_simple(uplay_id, accounts)
 
     def get_quota_summary(self) -> dict:

@@ -24,6 +24,9 @@ class Job:
         self.accid = accid
         self.folder = folder
         self.token_req = token_req
+        # Set when this game is served by a remote donor node instead of a local
+        # account — the worker then dispatches generation to that node.
+        self.node_id: Optional[str] = None
         self.status = JobStatus.QUEUED
         # Parsed output
         self.denuvo_token: Optional[str] = None

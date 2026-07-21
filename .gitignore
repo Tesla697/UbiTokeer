@@ -36,3 +36,8 @@ __pycache__/
 .env
 venv/
 .claude/
+
+# PyInstaller build output (node client / exe) — regenerated every build, never source
+build/
+dist/
+*.manifest
