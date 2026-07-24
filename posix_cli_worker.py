@@ -112,11 +112,16 @@ class PosixCliWorker:
             time.sleep(1)
             child.sendline("")
 
-            # Step 3: wait for tokens or a failure marker.
+            # Step 3: wait until the token VALUES (not just their labels) are present,
+            # or a failure marker shows up. Matching the value chars — not just the
+            # "OwnershipListToken" label — stops us from returning while the long token
+            # is still streaming in.
+            token_val = r"[A-Za-z0-9_\-+=/.]{16,}"
+            denuvo_re = re.compile(r"(?:DenuvoToken|GameToken)[:\s]+" + token_val)
+            owner_re = re.compile(r"Ownership(?:List)?Token[:\s]+" + token_val)
+
             def _done(full: str) -> bool:
-                has_denuvo = "DenuvoToken" in full or "GameToken" in full
-                has_owner = "OwnershipToken" in full or "OwnershipListToken" in full
-                if has_denuvo and has_owner:
+                if denuvo_re.search(full) and owner_re.search(full):
                     return True
                 for marker in ("ExceededActivations", "Authentication failed",
                                "You are not owning this App"):
@@ -125,7 +130,28 @@ class PosixCliWorker:
                 return False
 
             self._pump(child, collected, _done, deadline)
-            time.sleep(1)
+
+            # Drain the tail: the token value can keep streaming for a moment after the
+            # match, and the process may print a little more before exiting. Keep reading
+            # until the output goes quiet (~1.5s with no new bytes) or the process ends,
+            # so we never parse a truncated token. (The Windows worker reads continuously;
+            # this reproduces that.)
+            drain_deadline = min(deadline, time.time() + 6)
+            quiet = 0
+            while time.time() < drain_deadline:
+                try:
+                    data = child.read_nonblocking(size=4096, timeout=0.5)
+                    if data:
+                        collected.append(data)
+                        quiet = 0
+                except pexpect.TIMEOUT:
+                    quiet += 1
+                    if quiet >= 3:  # ~1.5s with no new data
+                        break
+                except pexpect.EOF:
+                    break
+                except Exception:
+                    break
 
             full_output = "".join(collected)
             if "Authentication failed" in full_output:

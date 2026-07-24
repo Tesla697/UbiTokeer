@@ -343,10 +343,17 @@ class JobQueue:
 
         last_error = None
         for attempt, acc in enumerate(ordered):
-            # Skip a tracked fallback with no quota left. The reserved primary is
-            # always tried; untracked/donor accounts are unlimited so never skipped.
+            # Skip a tracked fallback ONLY when it is genuinely USED UP (real
+            # recorded usage >= limit). We deliberately use has_real_capacity, NOT
+            # can_generate: can_generate also subtracts reservation holds, so with
+            # several tickets queued (each holding a slot) it would skip a fallback
+            # that still has real unused tokens — making this job give up with "all
+            # accounts reached" while free tokens exist. Reservations gate ticket
+            # OPENING, not generation; the single worker serialises real usage so
+            # this can't oversell past the real limit. The reserved primary
+            # (attempt 0) is always tried; untracked/donor accounts are unlimited.
             if attempt > 0 and acc.get("track_quota", True) \
-                    and not self._quota.can_generate(acc["email"], job.uplay_id):
+                    and not self._quota.has_real_capacity(acc["email"], job.uplay_id):
                 continue
 
             is_remote = bool(acc.get("remote"))

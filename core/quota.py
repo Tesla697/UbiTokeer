@@ -133,6 +133,21 @@ class QuotaTracker:
     def can_generate(self, account_email: str, uplay_id: str) -> bool:
         return self.get_remaining(account_email, uplay_id) > 0
 
+    def real_remaining(self, account_email: str, uplay_id: str) -> int:
+        """Real remaining IGNORING reservation holds: daily_limit - real used.
+
+        Reservations (other in-flight tickets' holds) are an admission gate for
+        OPENING tickets, not a real Ubisoft limit. Once a ticket is already open
+        and generating, the only thing that truly caps it is real recorded usage.
+        So the generation-time fallback uses this — not can_generate — so a ticket
+        gives up ONLY when every account is genuinely USED UP, never because a
+        free account happens to be held by another queued ticket."""
+        with self._lock:
+            return max(0, self._daily_limit - self._used_locked(account_email, uplay_id))
+
+    def has_real_capacity(self, account_email: str, uplay_id: str) -> bool:
+        return self.real_remaining(account_email, uplay_id) > 0
+
     def get_used(self, account_email: str, uplay_id: str) -> int:
         """Real recorded usage (window-aware), NOT counting live reservations.
         This is what the admin Quota panel shows and what +/- move, so transient
